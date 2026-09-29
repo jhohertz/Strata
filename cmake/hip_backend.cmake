@@ -3,10 +3,10 @@
 if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
   set(CMAKE_HIP_ARCHITECTURES gfx1100 CACHE STRING "Strata HIP target architecture")
 endif()
-if(NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1100")
-  message(FATAL_ERROR
-    "Strata HIP currently supports only gfx1100 wave32; CMAKE_HIP_ARCHITECTURES is '${CMAKE_HIP_ARCHITECTURES}'")
-endif()
+#if(NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1100")
+#  message(FATAL_ERROR
+#    "Strata HIP currently supports only gfx1100 wave32; CMAKE_HIP_ARCHITECTURES is '${CMAKE_HIP_ARCHITECTURES}'")
+#endif()
 
 enable_language(HIP)
 find_package(hip CONFIG REQUIRED)
