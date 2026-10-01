@@ -1034,23 +1034,35 @@ def cuda_lib_dirs():
 # No images yet.
 ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   # TheRock's wheels per GPU family
                 "gfx1101": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",
+                # gfx1103 is an iGPU: the -dgpu package holds no gfx1103 libraries (checked in the wheel's file
+                # list, 2026-10-02) - the family-wide -all package does.
+                "gfx1103": "https://rocm.nightlies.amd.com/v2/gfx110X-all/",
                 "gfx1200": "https://rocm.nightlies.amd.com/v2/gfx120X-all/",
                 "gfx1201": "https://rocm.nightlies.amd.com/v2/gfx120X-all/",
                 "gfx1030": "https://rocm.nightlies.amd.com/v2/gfx103X-all/"}
 ROCM_VERSION = os.environ.get("STRATA_ROCM_VERSION", "7.10.0a20251120")   # what Strata's HIP build was tested with
+# Per-arch overrides where the pinned build is not published in that family's index: the gfx110X-all series
+# skips 7.10.0a20251120 (it goes ...20251104, then 20251121), so the iGPU takes the nearest published build.
+ROCM_VERSIONS = {"gfx1103": os.environ.get("STRATA_ROCM_VERSION", "7.10.0a20251121")}
 ROCM_SYSTEM_MIN = (7, 0)       # an older system ROCm is passed over for the wheels (gfx1201 needs ROCm 6.4 or newer)
-AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1200", "gfx1201", "gfx1030")
+AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1103", "gfx1200", "gfx1201", "gfx1030")
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs has no product name
              "gfx1101": "AMD Radeon RX 7800 XT / 7700 XT (gfx1101)",
+             "gfx1103": "AMD Radeon iGPU (gfx1103)",
              "gfx1200": "AMD Radeon RX 9060 series (gfx1200)",
              "gfx1201": "AMD Radeon RX 9070 series / AI PRO R9700 (gfx1201)",
              "gfx1030": "AMD Radeon RX 6800 / 6900 series (gfx1030)"}
-AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX 9060 XT (gfx1200) and "
-             "RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series (gfx1030, unvalidated)")
+AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), the gfx1103 iGPU, RX 9060 XT "
+             "(gfx1200), RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series "
+             "(gfx1030, unvalidated)")
 
 
 def rocm_index(arch):
     return os.environ.get("STRATA_ROCM_INDEX") or ROCM_INDEXES[arch]
+
+
+def rocm_version_for(arch):
+    return os.environ.get("STRATA_ROCM_VERSION") or ROCM_VERSIONS.get(arch, ROCM_VERSION)
 
 
 def amd_gpus(sysfs="/sys"):
@@ -1471,15 +1483,16 @@ def rocm_root(archs):
         fail(f"cards of two GPU families ({', '.join(archs)}) need a system ROCm 7 (in /opt/rocm): AMD's Python "
              "wheels come per family", "install ROCm 7 system-wide, or use cards of one family (--gpu N for one card)")
     index = indexes[0]
+    version = list(dict.fromkeys(rocm_version_for(a) for a in archs))[0]   # one family, one version
     stamp = Path(sys.prefix) / ".strata-rocm.json"
     have = json.loads(stamp.read_text()) if stamp.exists() else {}
-    if have.get("version") != ROCM_VERSION or have.get("index") != index:
-        say(f"  Installing ROCm {ROCM_VERSION} for AMD GPUs into .venv (AMD's TheRock wheels, ~10 GB, no sudo) ...")
+    if have.get("version") != version or have.get("index") != index:
+        say(f"  Installing ROCm {version} for AMD GPUs into .venv (AMD's TheRock wheels, ~10 GB, no sudo) ...")
         pip = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--index-url", index]
-        if have.get("version") == ROCM_VERSION:        # the same version for another GPU family: its own libraries
-            run(pip + ["--force-reinstall", "--no-deps", f"rocm=={ROCM_VERSION}"])
-        run(pip + [f"rocm[libraries,devel]=={ROCM_VERSION}"])
-        stamp.write_text(json.dumps({"version": ROCM_VERSION, "index": index}))
+        if have.get("version") == version:             # the same version for another GPU family: its own libraries
+            run(pip + ["--force-reinstall", "--no-deps", f"rocm=={version}"])
+        run(pip + [f"rocm[libraries,devel]=={version}"])
+        stamp.write_text(json.dumps({"version": version, "index": index}))
     sdk = Path(sys.executable).parent / "rocm-sdk"
     root = Path(out([str(sdk), "path", "--root"]).strip())
     if not (root / "llvm" / "bin" / "clang++").exists():

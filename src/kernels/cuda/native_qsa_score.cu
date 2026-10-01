@@ -141,7 +141,7 @@ __global__ __launch_bounds__(64,1) void score_kernel(
 #endif
 }
 #else
-// gfx1100 has no CUDA ldmatrix/mma instruction sequence. Keep the same entry point and
+// RDNA3 (gfx1100/gfx1103) has no CUDA ldmatrix/mma instruction sequence. Keep the same entry point and
 // score contract with an ordered scalar F32 dot for each indexer head. The four heads
 // run independently; their ReLU'd scores are then added in the documented head order.
 // This path favors a well-defined fallback over pretending the CUDA PTX is portable.

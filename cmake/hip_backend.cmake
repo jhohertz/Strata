@@ -4,12 +4,13 @@
 if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
   set(CMAKE_HIP_ARCHITECTURES gfx1100 CACHE STRING "Strata HIP target architecture(s), e.g. gfx1100 or gfx1100;gfx1201")
 endif()
-# Validated on real cards: gfx1100 (RX 7900 XT / XTX) and gfx1201 (RX 9070 / 9070 XT, Radeon AI PRO R9700) by the
-# maintainers; gfx1101 (RX 7800 XT, #254) and gfx1200 (RX 9060 XT, #256) by their owners. gfx1102 (RX 7600) has the
-# same LDS limit and dot4 instruction and passed ctest (#192), but no model run has been reported yet. RDNA2 gfx1030 (RX 6800 / 6900) has the
-# same LDS limit and wave32 but an older dot4 instruction (v_dot4_i32_i8, hip_compat/intrinsics.hpp); a community
-# report ran it (#311), the maintainers have not.
-set(_strata_hip_validated gfx1100 gfx1201)
+# Validated on real cards: gfx1100 (RX 7900 XT / XTX), gfx1103 (integrated; docs/GFX1103.md) and
+# gfx1201 (RX 9070 / 9070 XT, Radeon AI PRO R9700) by the maintainers; gfx1101 (RX 7800 XT, #254) and
+# gfx1200 (RX 9060 XT, #256) by their owners. gfx1102 (RX 7600) has the same LDS limit and dot4 instruction and
+# passed ctest (#192), but no model run has been reported yet. RDNA2 gfx1030 (RX 6800 / 6900) has the same LDS
+# limit and wave32 but an older dot4 instruction (v_dot4_i32_i8, hip_compat/intrinsics.hpp); a community report
+# ran it (#311), the maintainers have not.
+set(_strata_hip_validated gfx1100 gfx1103 gfx1201)
 set(_strata_hip_community gfx1101 gfx1200)
 set(_strata_hip_unvalidated gfx1102 gfx1030)
 # CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
@@ -28,7 +29,7 @@ foreach(_arch IN LISTS _strata_hip_norm)
     message(WARNING "Strata HIP: ${_base} builds, but it is not validated on a real card yet; please report results")
   else()
     message(FATAL_ERROR
-      "Strata HIP supports wave32 gfx1100, gfx1101, gfx1200 and gfx1201 (unvalidated: ${_strata_hip_unvalidated}); "
+      "Strata HIP supports wave32 gfx1100, gfx1101, gfx1103, gfx1200 and gfx1201 (unvalidated: ${_strata_hip_unvalidated}); "
       "CMAKE_HIP_ARCHITECTURES is '${CMAKE_HIP_ARCHITECTURES}'")
   endif()
   list(APPEND STRATA_HIP_ARCH_LIST "${_base}")
@@ -51,6 +52,23 @@ if(NOT TARGET hip::host)
 endif()
 if(NOT TARGET roc::hipblas)
   message(FATAL_ERROR "The ROCm hipblas CMake package did not provide roc::hipblas")
+endif()
+# A machine can carry two ROCm installs (a distro one under /usr plus an /opt/rocm tree): the hip/hipblas/
+# hipblaslt configs are found per tree, but the runtime loader follows the ld cache, which prefers the distro
+# tree - and a tree that lacks this device's rocBLAS kernels aborts at the first GEMM.  Pin the build tree's
+# rpath to the installation CMake configured against; its libraries carry $ORIGIN rpaths that keep the rest
+# in-tree (no LD_LIBRARY_PATH needed at run time).
+set(_strata_rocm_libdir "")
+get_target_property(_strata_hip_lib hip::host IMPORTED_LOCATION)
+if(_strata_hip_lib AND NOT _strata_hip_lib MATCHES "NOTFOUND")
+  get_filename_component(_strata_rocm_libdir "${_strata_hip_lib}" DIRECTORY)
+endif()
+if(NOT _strata_rocm_libdir AND DEFINED hipblas_DIR)
+  get_filename_component(_strata_rocm_libdir "${hipblas_DIR}/../.." ABSOLUTE)
+endif()
+if(_strata_rocm_libdir)
+  set(CMAKE_BUILD_RPATH "${_strata_rocm_libdir}")
+  message(STATUS "Strata: HIP build rpath ${_strata_rocm_libdir}")
 endif()
 if(TARGET roc::hipblaslt)
   set(STRATA_HIPBLASLT_AVAILABLE ON)

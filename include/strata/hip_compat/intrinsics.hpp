@@ -15,8 +15,8 @@ __device__ __forceinline__ int signed_byte(uint32_t word, int lane) {
 
 // CUDA's signed __dp4a: four signed byte products accumulated modulo 2^32.
 __device__ __forceinline__ int dp4a(int a, int b, int c) {
-#if (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1200__) || \
-     defined(__gfx1201__)) && __has_builtin(__builtin_amdgcn_sudot4)
+#if (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+     defined(__gfx1200__) || defined(__gfx1201__)) && __has_builtin(__builtin_amdgcn_sudot4)
     // RDNA3 and RDNA4 expose the signed/unsigned dot4 form (v_dot4_i32_iu8). Mark
     // both packed operands signed to preserve CUDA __dp4a semantics; keep the
     // portable path for other HIP compilers/targets.
@@ -127,6 +127,16 @@ __device__ __forceinline__ unsigned ballot_sync(uint32_t mask, int predicate) {
 #define __ballot_sync(mask, predicate) (::strata::hip_compat::ballot_sync((mask), (predicate)))
 // AMD's sleep instruction accepts only 0..15; the synchronization loops use it as a
 // backoff hint, so use its smallest portable delay independently of CUDA cycle counts.
+// gfx1103 iGPU exception: the verify flag-wait kernels (wait_flag_ge[_or]_kernel in
+// verify_kernels.cu) spin on GTT-mapped host flags, and on the reference APU inserting
+// s_sleep(1) between the polls breaks a verify window - "layer 45 never rang
+// (unspecified launch failure)" - while the 0.1.29 tight spin completes the same windows
+// reliably (reproduced back-to-back on 2026-10-01; docs/GFX1103.md §11).  Keep the tight
+// spin on gfx1103; the backoff hint remains for the dGPU cards that passed with it.
+#if defined(__gfx1103__)
+#define __nanosleep(cycles)
+#else
 #define __nanosleep(cycles) __builtin_amdgcn_s_sleep(1)
+#endif
 
 #endif  // defined(__HIPCC__)
