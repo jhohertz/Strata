@@ -1,7 +1,7 @@
-# AMD Radeon: the HIP backend (gfx1100, gfx1101, gfx1200, gfx1201, gfx1030)
+# AMD Radeon: the HIP backend (gfx1100, gfx1101, gfx1103, gfx1200, gfx1201, gfx1030)
 
 Strata runs on AMD Radeon cards through its HIP backend, the same engine as on NVIDIA compiled for AMD. This page
-covers the build on Linux (on Windows a ready-made engine, see [Windows](#windows)) for the RX 7900 XT / XTX (RDNA3, gfx1100) and the
+covers the build on Linux (on Windows a ready-made engine, see [Windows](#windows)) for the RX 7900 XT / XTX (RDNA3, gfx1100), the integrated gfx1103 iGPU (RDNA3, wave32; [GFX1103.md](GFX1103.md)) and the
 RX 9070 / 9070 XT / Radeon AI PRO R9700 (RDNA4, gfx1201; see [RDNA4](#rdna4-gfx1201)). The RX 7800 XT / 7700 XT
 (gfx1101) and the RX 9060 XT (gfx1200) were validated by their owners (see [Community-validated
 cards](#community-validated-cards)); the RX 6800 / 6900 series (RDNA2, gfx1030) builds and runs too, reported by a community machine and not yet validated by the maintainers (see [RDNA2](#rdna2-gfx1030)). Setup chooses it by itself on a PC with no NVIDIA card Strata can use (`--backend hip` on a PC with both); the
@@ -25,8 +25,9 @@ the kernel's amdgpu driver (no ROCm install needed):
 ./setup.sh --backend hip
 ```
 
-- **Detection:** setup finds the card through the kernel's KFD topology. Integrated Radeon GPUs are listed as not
-  supported. On a PC without an NVIDIA card Strata can use, `--backend hip` is chosen automatically.
+- **Detection:** setup finds the card through the kernel's KFD topology. The integrated gfx1103 iGPU is
+  supported; other integrated Radeon GPUs are listed as not supported. On a PC without an NVIDIA card Strata can
+  use, `--backend hip` is chosen automatically.
 - **ROCm:** a system ROCm 7 in `/opt/rocm` (or `$ROCM_PATH`) with hipcc and hipBLAS is used when present. Otherwise
   (or when it is older than 7.0) ROCm is installed into `.venv` from AMD's TheRock wheels (~10 GB, no sudo), pinned
   to the version this backend was tested with, from the card family's index: `gfx110X-dgpu` for gfx1100 / gfx1101,
@@ -131,10 +132,22 @@ ctest (#192) but no model run has been reported; so does gfx1030 (RDNA2: the old
 wave32. A binary carried to another card stops with the card's name, its architecture and the build's list,
 instead of failing later with "invalid device function".
 
+For the gfx1103 iGPU, pass `-DCMAKE_HIP_ARCHITECTURES=gfx1103` and build all
+targets, not just `strata` ([GFX1103.md](GFX1103.md)).
+
 If CMake cannot find the HIP compiler, add
 `-DCMAKE_HIP_COMPILER=/path/to/rocm/llvm/bin/clang++`. On the Fedora-family test
 host this was `/usr/lib64/rocm/llvm/bin/clang++`. Use the compiler and libraries
 from the same ROCm installation. Do not enable both GPU backends in one build.
+
+If the machine carries **two ROCm installs** (a distro one under `/usr` plus an
+`/opt/rocm` tree), configure with `-DCMAKE_PREFIX_PATH=<the tree you want>` —
+otherwise CMake may bind to whichever configs the system path exposes first, and
+a tree that lacks the device's rocBLAS kernels aborts at the first GEMM
+("Cannot read TensileLibrary … for GPU arch : gfx1103").
+`cmake/hip_backend.cmake` pins the build tree's rpath to the configured ROCm's
+lib directory, so the binaries keep using that same tree at runtime with no
+`LD_LIBRARY_PATH` (see [GFX1103.md](GFX1103.md) §9.9).
 
 Native IQ experts are enabled by default. CMake fetches the llama.cpp revision
 pinned by this repository. For an offline build, point `STRATA_GGML_DIR` at a
@@ -339,6 +352,9 @@ prompt speed with and without it before keeping it.
 Shipped tables:
 
 - `gfx1100-hipblaslt-100100.txt`, `gfx1100-hipblaslt-100200.txt`: RX 7900 XTX.
+- `gfx1103-hipblaslt-100401.txt`: the reference gfx1103 APU (Ryzen 7 8700G, system ROCm 10.0.0~pre4); the bf16
+  dense row is a `hipblasGemmEx` fallback - the stack's Lt heuristics return NaN for that shape
+  ([GFX1103.md](GFX1103.md)).
 - `gfx1201-hipblaslt-100500.txt`: Radeon AI PRO R9700 (gfx1201, 32 GB), calibrated with ROCm 10.2.0a20260914
   (AMD's `gfx120X-all` nightly, hipBLASLt 1.5.0, library build `d3164197`). 16 dense GEMM geometries at T=4096 and
   T=8192, 32 rows. setup uses it only when the installed hipBLASLt reports 1.5.0 (it is found in `/opt/rocm`
@@ -349,6 +365,27 @@ Shipped tables:
   valid: the engine falls back to hipBLASEx for an id the library rejects, and the test still passes. Run it with
   `STRATA_HIPBLASLT_VERBOSE=1` and look for `fallbacks=0` in its summary line, and recalibrate with
   `tune_hipblaslt` before using this table with a different 1.5.0 build.
+
+## gfx1103 (integrated)
+
+The gfx1103 iGPU shares RDNA3's wave32 ISA, 64 KiB LDS and the signed dot4
+instruction with gfx1100, so the same kernels run; the supported-architecture
+sets in CMake, the runtime gate and setup.py include it. The full analysis, test
+plan and machine notes are in [GFX1103.md](GFX1103.md).
+
+- Build with `-DCMAKE_HIP_ARCHITECTURES=gfx1103`
+  (`-DCMAKE_PREFIX_PATH=/opt/rocm` on machines with a second distro ROCm,
+  above). A calibrated table exists for the reference APU's stack:
+  `tools/hip/gfx1103-hipblaslt-100401.txt`; the bf16 dense GEMM falls back to
+  plain `hipblasGemmEx` there (the stack's Lt heuristics return NaN for that
+  shape — [GFX1103.md](GFX1103.md) §4.6).
+- The GPU's "VRAM" is GTT — system RAM behind the GPU's translation table (the
+  reference APU reports 22.86 GiB). `--expert-cache auto` sizes to whatever is
+  reported; start with `--vram-reserve-mib 1024` and a modest context.
+- Use `--mmap-experts` when the memlock rlimit is small (the 8 MiB default cannot
+  back the pinned expert arenas).
+- Never build or run with `HSA_OVERRIDE_GFX_VERSION` set: the runtime validates
+  the real architecture, and a spoofed name fails at the driver level.
 
 ## Original backend validation (PR #94)
 
