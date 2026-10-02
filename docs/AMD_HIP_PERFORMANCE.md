@@ -181,6 +181,29 @@ system-marker recall; and a buried-fact recall at ~1,170-token batched
 prefill (724913).  `ple_parity` is excluded: its fixtures are part of the
 unpublished upstream suite.
 
+Engine 0.1.36 (2026-10-02, rebased branch, warm page cache, same configuration;
+the 0.1.31 era had no clean APU numbers - its runs faulted or hung):
+
+| Phase | 0.1.29 | 0.1.36 | Note |
+| --- | --- | --- | --- |
+| Prefill, warm batched (1,162 tok, 3 chunks) | 68.8 tok/s | **37.1 / 37.7 tok/s** (2 runs) | -46 % - a real regression on this APU; suspected the type-42 `kSplit` multi-token dequant/GU kernels (the 0.1.36 CUDA fused prompt path does not apply to HIP) and/or the new "prompt path borrows N cache slots" interaction; unconfirmed - `STRATA_OLD_IQ_MMVQ=1` A/B queued |
+| Prefill, cold single chunk (44–73 tok) | 8.3–27.3 tok/s | 9.6–14.6 tok/s (5 runs) | same spread |
+| Decode, longfill-follow (160 tok) | 13.5–13.6 tok/s | **19.4–19.5 tok/s** (2 runs) | +44 % |
+| Decode, short checks (160 tok) | 5.4–13.5 tok/s | 7.5–13.7 tok/s (5 runs) | same range |
+
+Power/thermal under the long prefill (0.5 s sampling, APU package sensors):
+package power peak **65.1 W** (mean 28.5), iGPU junction **58 °C**, CPU
+**62.4 °C** - the iGPU stays well inside its thermal envelope at this
+workload.  `amdgpu`'s `mem_info_vram_used` reports ~170 MiB throughout
+(the expert cache is GTT-mapped host memory, not counted there).
+
+Correctness on 0.1.36 is intermittent: of 9 engine runs in 40 minutes,
+7 passed the known-answer checks and 2 died with `unspecified launch
+failure` + `hipModuleUnload failed` (exit 1, self-terminating) - once in
+`iq_dequant_gu_f16` (longfill), once in `prefill copy_i32` (arithmetic).
+The fault site moves between runs, as in the 0.1.31 record
+(`docs/GFX1103.md` §11).  The numbers above are from the passing runs.
+
 A/B (post-reboot, 2026-09-30 01:31–01:33, warm page cache):
 
 | Arm | Prefill (1,162 tok / 44 tok) | Decode | Note |
