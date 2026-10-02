@@ -138,3 +138,37 @@ the gfx1150–gfx1153 Strix Point family AMD already ships wheels for,
 gfx1201 Strix Halo) runs today with the memlock workaround, the 7.7 GiB of
 pointless copies and the copy-machinery fault surface; aliasing removes all
 three. `--mmap-experts` stops being mandatory on APUs.
+
+## P0 results (first boot, 2026-10-02 19:38 boot)
+
+Gate green at 19:41. Two runs, one fault:
+
+| run | config | prefill | decode | streaming | result |
+| --- | --- | --- | --- | --- | --- |
+| E1a 19:42 | `--expert-cache 6000`, cold page cache | 34.74 tok/s (33.45 s) | 18.75 tok/s | 29,494 streamed, 0 by DMA, host 22.9 s (68 % of prefill), resident 10,244 | PASS (exit 0) |
+| E1b 19:45 | `--expert-cache 0` = **auto** (generate.cpp:2269 maps 0 to -1) | - | - | - | **FAIL: unspecified launch failure, exit 1** |
+
+E1a confirms the 0.1.36 baseline on a fresh APU (37.1/37.7 warm → 34.7 cold) and
+that the 16:44 degraded state was gone at 19:42. E1b is the first data point for
+a second hypothesis: it sized to **24,576 slots (33.9 GiB of the 39.6 GiB free)**
+- `auto` treats the APU's 48 GiB GTT like a dGPU's VRAM and fills nearly all of
+it - and the fault landed in that configuration. Third fault overall (15:38
+`iq_dequant_gu_f16`, 16:44 `prefill copy_i32`, 19:45 site not captured, exit
+before the site line). Memory pressure from an oversized GTT arena may be a
+trigger or a co-factor; indistinguishable from the baseline intermittency without
+more runs, which the machine rules forbid after a fault.
+
+**Revised P0 order (next fresh boot, gate first, 60 s+ between runs):**
+
+1. E1c `STRATA_OLD_IQ_MMVQ=1` longfill + arithmetic (the kernel-vs-streaming
+   split for the -46 % and the faults) - cold, as the first runs.
+2. E1b' the no-cache pole done properly: a **small** fixed cache (`--expert-cache
+   500`, ~0.69 GiB) instead of `0`/auto, so the pole is "almost no VRAM tier"
+   without the 33.9 GiB arena.
+3. E1a warm re-run (same 6000 config) to pair with the 34.7 cold number.
+4. Micro-benchmark (GTT-read vs filled-slot dequant+GEMV, with/without THP) -
+   written as a small test on this branch, built before the run window.
+
+`--expert-cache 0` must be documented (and probably fixed upstream) as "auto"
+for APU users: it silently sizes a 33.9 GiB arena on a box where `auto` is
+known to over-allocate (GFX1103.md already says "never auto").
