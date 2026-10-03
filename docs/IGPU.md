@@ -283,3 +283,28 @@ gdb backtraces of every thread) captured automatically ~45 s into the
 silence, then a kill. The backtraces separate "CPU parked in
 cudaStreamSynchronize" (a GPU-side wedge) from "CPU parked in a condition
 variable" (a host-thread deadlock in the pool/stager/PLE machinery).
+
+**Second run (2026-10-02 23:03, boot 3, gate green, `STRATA_TRACE=1`,
+forensic monitor): the hang reproduced exactly, and the monitor nailed the
+shape.** The trace shows `prompt chunk 0 of 44`, then silence; the iGPU
+sat at **99 % busy for 45+ s** - a kernel on the GPU that never finishes,
+not a host-side condition-variable deadlock (that would show ~0 % busy).
+The first forensic pass attached gdb to the wrong process (the `timeout`
+wrapper), so no backtraces yet; the monitor now targets the real engine
+(`pgrep -x strata`), captures per-thread wchan/state, and lets the 900 s
+timeout do the single kill.
+
+Experiment ladder for the next two boots:
+- **Boot 3, run A**: alias arithmetic, forensics v2. Expected: the main
+  thread parked in a stream sync (GPU-side wedge) plus the last kernel
+  before the hang.
+- **Boot 4, run B**: the same run, but with the page cache **pre-warmed**
+  first (a sequential read of the 31.6 GiB `experts.bin`). On the copy
+  path the CPU faults the file pages in before the GPU reads; on the alias
+  path the GPU's kernels fault 31 GiB of cold NVMe pages through the KFD
+  GTT path for the first time in this codebase. If run B passes, the wedge
+  is in the GPU-side page-fault path, and the fix is to pre-populate the
+  pages on the host at alias open (one ~10 s sequential pass, or
+  `MADV_POPULATE_READ` on the mapping) - the alias design stands. If run B
+  hangs identically, it is sustained GTT kernel reads that wedge, and the
+  strategy changes (bounce-buffer the prompt path, keep decode aliasing).

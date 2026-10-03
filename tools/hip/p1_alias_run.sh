@@ -18,6 +18,9 @@ echo "== $(date -Is) alias arithmetic (STRATA_TRACE=1)"
     --vram-reserve-mib 1024 --greedy --max-new 160 --tokens "$IDS" \
     > "$OUT/arit.out" 2> "$OUT/arit.err" ) &
 PID=$!
+EPID=""   # the real engine: the subshell's child named strata (v1 attached to the timeout wrapper by mistake)
+for _ in $(seq 1 120); do EPID=$(pgrep -x strata 2>/dev/null | head -1); [ -n "$EPID" ] && break; sleep 1; done
+echo "engine pid=$EPID"
 busy_file=/sys/class/drm/card1/device/gpu_busy_percent
 last_lines=0; hung_since=0; diagnosed=0
 while kill -0 "$PID" 2>/dev/null; do
@@ -33,16 +36,17 @@ while kill -0 "$PID" 2>/dev/null; do
         echo "  HANG FORENSICS (quiet ${quiet}s, gpu_busy=${busy}%)"
         {
             echo "=== $(date -Is) gpu_busy_percent=$(cat $busy_file 2>/dev/null)"
-            echo "=== process state"; ps -o pid,stat,wchan:40,time -p "$PID" 2>/dev/null
-            for t in $(ls /proc/"$PID"/task 2>/dev/null); do
-                echo "--- thread $t: $(tr -d '\0' < /proc/$PID/task/$t/comm 2>/dev/null) state=$(cut -d' ' -f3 /proc/$PID/task/$t/stat 2>/dev/null)"
-                cat /proc/$PID/task/$t/wchan 2>/dev/null; echo
+            echo "=== process state (engine $EPID)"; ps -o pid,stat,wchan:40,time -p "$EPID" 2>/dev/null
+            for t in $(ls /proc/"$EPID"/task 2>/dev/null); do
+                echo "--- thread $t: $(tr -d '\0' < /proc/$EPID/task/$t/comm 2>/dev/null) state=$(cut -d' ' -f3 /proc/$EPID/task/$t/stat 2>/dev/null) wchan=$(cat /proc/$EPID/task/$t/wchan 2>/dev/null)"
             done
-            echo "=== gdb backtraces"
-            gdb -p "$PID" -batch -ex 'set pagination off' -ex 'thread apply all bt 12' 2>/dev/null | grep -E '^(Thread|#[0-9])' | head -80
+            echo "=== last trace lines"; tail -6 "$OUT/arit.err" | cut -c1-160
+            echo "=== gdb backtraces (main thread deep, all threads shallow)"
+            gdb -p "$EPID" -batch -ex 'set pagination off' \
+                -ex 'thread 1 bt 24' \
+                -ex 'thread apply all bt 5' 2>/dev/null | grep -E '^(Thread|#[0-9])' | head -120
         } > "$OUT/hang_forensics.txt" 2>&1
-        echo "  captured -> $OUT/hang_forensics.txt; killing (the APU is wedged anyway)"
-        kill -9 "$PID" 2>/dev/null
+        echo "  captured -> $OUT/hang_forensics.txt (the 900 s timeout will kill the engine)"
     fi
 done
 wait "$PID"; RC=$?
