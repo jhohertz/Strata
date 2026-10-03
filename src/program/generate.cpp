@@ -2820,7 +2820,14 @@ int main(int argc, char** argv) {
                         okp = false;
                     } else {
                         const uint64_t alias_headroom = std::min<uint64_t>(o.resident_headroom, 2ull << 30);
-                        if (file_src->pin_cache_complement(xcache, err, o.resident_pin, {}, -1, alias_headroom,
+                        // igpu-rework P1 run 17: a pageable complement hangs the driver - the first kernel read
+                        // starts a GTT page-fault storm over 31.6 GiB while a lazy kernel-module load (the PLE
+                        // postops' first launch, hsa_executable_freeze -> blit) is in flight, and the two HSA
+                        // fault-handler threads sit in KFD_MEMORY_PREFAULT (docs/IGPU.md, run 17 backtrace).
+                        // A page-locked allocation (the 260 MiB embedding proves this path on this APU) has no
+                        // lazy faults at all.  pin=false would fall through to malloc + hipHostRegister, which
+                        // the micro passed but the engine does not.
+                        if (file_src->pin_cache_complement(xcache, err, true, {}, -1, alias_headroom,
                                                            o.resident_budget, nullptr) &&
                             // the kernels then read this RAM directly; unregistered host memory faults on this
                             // iGPU (docs/IGPU.md) - register it (no copy) or fall back to the H2D touch

@@ -574,3 +574,35 @@ The engine now also traces inside the layer body: "PLE block done",
 so the next run names the exact stage of layer 1, and the gdb
 backtrace says whether the host is stuck in a page fault / reclaim or
 the GPU is stuck in a kernel.
+
+**Run 17 (2026-10-03 17:01, boot of 16:31): the root cause, by
+backtrace.**
+- scatter micro: PASS again (54.4 GB/s).
+- traced engine: layer 0 completed fully ("PLE block done" x2 - the
+  two halves - "attn+mlp done, experts begin", "moe done" - the alias
+  gather + MMQ over the host complement WORK), then "prompt layer 1"
+  and silence: the hang is inside the layer-1 PLE block.
+- the gdb backtrace (SIGSTOP + `thread apply all bt`): the main thread
+  is in `hsa_executable_freeze -> AmdHsaCodeLoader::FreezeExecutable ->
+  RegionMemory::Freeze -> BlitKernel::SubmitLinearCopyCommand` waiting
+  on an hsa signal - **a lazy kernel-module load** (the PLE postops'
+  first launch) whose code-object blit to the GPU never completes.
+  Two early HSA runtime threads (created at device init) are stuck in
+  `ioctl(KFD, KFD_IOC_MEMORY_PREFAULT)` - the fault handlers.
+
+  The story: the first kernel read of the 31.64 GiB *pageable*
+  complement starts a GTT page-fault storm; in flight, the lazy module
+  load's blit contends with the fault handlers and the KFD path deadlocks
+  (no fault, no completion - the exact shape of every hang).
+
+**Fix (in the tree):** the alias complement is now page-locked from
+birth - `pin_cache_complement(..., pin=true, ...)` in the alias block
+(the `cudaHostAlloc` path, the same one the 260 MiB embedding uses
+successfully on this APU).  No lazy faults, no storm; the
+register_complement_for_gpu step is a no-op on a full pin.  Fallback on
+refusal: the old malloc + register path.
+
+Boot protocol 5 (tools/hip/p1_boot_run5.sh): gate, traced engine under
+gdb (backtrace again if it still hangs), and on a PASS it chains
+python + marker + longfill on the same boot - a clean run does not
+degrade the APU, so a green boot is the whole P1 characterization.
