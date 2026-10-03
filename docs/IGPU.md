@@ -430,3 +430,34 @@ Boot 8 protocol:
    complement's shape)?  A fault means the arena must be chunked.
 3. engine alias arithmetic (no dd needed: the complement fills from NVMe
    on the CPU at startup; the GPU never touches the file).
+
+**Run 8 (2026-10-03 00:17, boot 8): a 32 GiB ANONYMOUS VMA faults too.**
+`--anon 32` (map 0x77baf25ff010): `illegal memory access`.  So the
+discriminator is not file-vs-anonymous - it is **the size of one VMA**
+(the P0 1 GiB anonymous read passed at 82.6 GB/s; 32 GiB anonymous and
+31.6 GiB file and 1 GiB file slices all fault).  The complement, as
+designed, is one 31.6 GiB VMA: it cannot be mapped by the KFD path.
+
+**Chunking design (to be validated in the micro before touching the
+engine):** a `PROT_NONE` VA reservation of the full span, with the
+committed chunks placed inside it separated by 64 KiB `PROT_NONE` gaps.
+The gaps keep the committed chunks **separate VMAs** (the kernel merges
+adjacent same-flag VMAs, which would defeat the purpose), and the KFD
+path appears to map per VMA.  With per-chunk bases the dense
+`complement_offsets_` stay valid once the gaps are folded into them, so
+`blob()` / `has_resident` / the fill / the pointer table are unchanged.
+`igpu_gtt_micro` gained `--fixed <va> <gib>` (anonymous at a chosen VA:
+VA-window vs size) and `--chunks <n> <gib>` (the exact complement shape:
+n committed chunks in a PROT_NONE reservation, every committed byte
+read by the kernel).
+
+Boot 9 protocol (one boot, ascending, stop at the first fault):
+  1. gate
+  2. size sweep: --anon 1, 2, 4, 8, 16   (brackets the per-VMA cap)
+  3. chunk test at the sweep's ceiling: --chunks 4 <cap> (or 8 <cap/2>)
+     - pass: chunking is validated; implement it in pin_cache_complement
+       with the measured chunk size and run the engine.
+     - fault: the KFD unit is not the VMA (a physical-range model); the
+       complement must then be split into separate allocations (no
+       shared reservation) - the pointer table already stores absolute
+       pointers, so only the arena plumbing changes.

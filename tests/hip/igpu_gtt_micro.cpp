@@ -141,6 +141,78 @@ int run_slice_arm(const char* path, long long off, long long len) {
     return got == ref ? 0 : 3;
 }
 
+// P1 fixed arm: an anonymous MAP_FIXED_NOREPLACE VMA at a chosen VA.  Separates the VA-window
+// question (a region at a known-good / known-bad VA) from size and physical placement: same size,
+// different VA, same allocator-free pages.
+int run_fixed_arm(unsigned long long va, long long gib) {
+    const long long bytes = gib * (1ll << 30);
+    uint8_t* p = (uint8_t*) mmap((void*) va, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS |
+                                     MAP_FIXED_NOREPLACE,
+                                 -1, 0);
+    if (p == MAP_FAILED) { std::perror("igpu_gtt_micro: mmap fixed"); return 2; }
+    if ((uintptr_t) p != va) { std::fprintf(stderr, "igpu_gtt_micro: fixed VA moved to %p\n", (void*) p); return 2; }
+    for (long long i = 0; i < bytes; i += 4096) p[i] = 0x5a;   // touch: real pages
+    std::printf("igpu_gtt_micro: fixed %lld GiB at %012llx\n", gib, va);
+    const int kBlocks = 512;
+    uint32_t* d_partials = nullptr;
+    CHECK(hipMalloc(&d_partials, kBlocks * sizeof(uint32_t)));
+    CHECK(hipMemsetAsync(d_partials, 0, kBlocks * sizeof(uint32_t), 0));
+    const auto t0 = std::chrono::steady_clock::now();
+    xor_read_kernel<<<kBlocks, 256, 0, (hipStream_t) 0>>>((const float4*) p, bytes / 16, d_partials);
+    CHECK(hipGetLastError());
+    CHECK(hipStreamSynchronize(0));
+    const long long ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("F-fixed  %7.1f GB/s  (%lld ms for %lld GiB)\n", (double) bytes / 1e9 / (ms / 1000.0), (long long) ms,
+                gib);
+    CHECK(hipFree(d_partials));
+    munmap(p, (size_t) bytes);
+    return 0;
+}
+
+// P1 chunks arm: the complement's proposed shape - a PROT_NONE VA reservation with `n` committed
+// chunks of `gib` GiB each, separated by 64 KiB PROT_NONE gaps (the gaps keep the committed chunks
+// separate VMAs, which is what the KFD path appears to map).  The kernel reads every committed byte.
+int run_chunks_arm(int n, long long gib) {
+    const long long chunk = gib * (1ll << 30);
+    const long long gap = 64ll << 10;
+    const long long total_va = (long long) n * (chunk + gap);
+    uint8_t* reserve = (uint8_t*) mmap(nullptr, (size_t) total_va, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reserve == MAP_FAILED) { std::perror("igpu_gtt_micro: reserve"); return 2; }
+    for (int c = 0; c < n; ++c) {
+        uint8_t* at = (uint8_t*) mmap(reserve + (long long) c * (chunk + gap), (size_t) chunk, PROT_READ | PROT_WRITE,
+                                      MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (at == MAP_FAILED) { std::perror("igpu_gtt_micro: commit chunk"); return 2; }
+        for (long long i = 0; i < chunk; i += 4096) at[i] = 0x5a;   // touch: real pages
+    }
+    std::printf("igpu_gtt_micro: %d chunks x %lld GiB (+64 KiB gaps) in a %.2f GiB reservation at %p\n", n, gib,
+                (double) total_va / 1073741824.0, (void*) reserve);
+    const int kBlocks = 512;
+    uint32_t* d_partials = nullptr;
+    uint32_t* h_partials = (uint32_t*) std::malloc(kBlocks * sizeof(uint32_t));
+    CHECK(hipMalloc(&d_partials, kBlocks * sizeof(uint32_t)));
+    // read each chunk (the gaps are PROT_NONE and must never be touched)
+    for (int c = 0; c < n; ++c) {
+        const uint8_t* at = reserve + (long long) c * (chunk + gap);
+        CHECK(hipMemsetAsync(d_partials, 0, kBlocks * sizeof(uint32_t), 0));
+        const auto t0 = std::chrono::steady_clock::now();
+        xor_read_kernel<<<kBlocks, 256, 0, (hipStream_t) 0>>>((const float4*) at, chunk / 16, d_partials);
+        CHECK(hipGetLastError());
+        CHECK(hipStreamSynchronize(0));
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+        CHECK(hipMemcpy(h_partials, d_partials, kBlocks * sizeof(uint32_t), hipMemcpyDeviceToHost));
+        uint32_t got = 0;
+        for (int b = 0; b < kBlocks; ++b) got ^= h_partials[b];
+        std::printf("chunk %d %7.1f GB/s  (%lld ms)\n", c, (double) chunk / 1e9 / (ms / 1000.0), (long long) ms);
+    }
+    CHECK(hipFree(d_partials));
+    munmap(reserve, (size_t) total_va);
+    std::printf("igpu_gtt_micro: chunks arm done\n");
+    return 0;
+}
+
 // P1 anon arm: a large anonymous region (the complement-fallback question: does the KFD path map a
 // big anonymous VMA at all?).  malloc + touch, one kernel read, no checksum (contents are a pattern).
 int run_anon_arm(long long gib) {
@@ -230,6 +302,10 @@ int main(int argc, char** argv) {
                                  (long long) std::atof(argv[i + 3]) * (1ll << 30));
         if (std::strcmp(argv[i], "--anon") == 0 && i + 1 < argc)
             return run_anon_arm((long long) std::atof(argv[i + 1]));
+        if (std::strcmp(argv[i], "--fixed") == 0 && i + 2 < argc)
+            return run_fixed_arm((unsigned long long) strtoull(argv[i + 1], nullptr, 16), (long long) std::atof(argv[i + 2]));
+        if (std::strcmp(argv[i], "--chunks") == 0 && i + 3 < argc)
+            return run_chunks_arm(std::atoi(argv[i + 2]), (long long) std::atof(argv[i + 3]));
     }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;
     constexpr long long bytes = 1ll << 30;   // 1 GiB
