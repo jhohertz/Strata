@@ -140,6 +140,8 @@ struct HipLtDescriptors {
     }
 };
 
+void hipblaslt_warmup_all(HipLtState& state);   // defined below try_hipblaslt
+
 std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t workspace_bytes) {
     const char* path = std::getenv("STRATA_HIPBLASLT_TUNING");
     if (!path || !*path) return nullptr;
@@ -174,6 +176,7 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     }
     std::fprintf(stderr, "prefill gemm: hipBLASLt tuning enabled (%zu rows, %s, version %d)\n",
                  state->table.rows().size(), arch.c_str(), version);
+    hipblaslt_warmup_all(*state);
     return state;
 }
 
@@ -288,6 +291,48 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     ++mutable_state->fallbacks;
     mutable_state->fallback_shapes.emplace(type, (int) t, (int) n, (int) k, (int) ldy);
     return false;
+}
+// igpu-rework P1 (runs 16-18): on this APU the KFD path deadlocks the LAZY hipBLASLt algorithm load -
+// the code-object blit of a tuned shape's first matmul, mid-prompt: the main thread waits forever in
+// hsa_executable_freeze -> BlitKernel::SubmitLinearCopyCommand while two HSA fault-handler threads sit
+// in KFD_IOC_MEMORY_PREFAULT (docs/IGPU.md, backtraces).  One matmul per tuned row, run here before the
+// prompt in a calm state, makes the prompt's first matmul of each shape a plain launch of an already
+// loaded algorithm.  Opt-in (STRATA_HIPBLASLT_WARMUP): a no-op without it, so the dGPU path is untouched.
+void hipblaslt_warmup_all(HipLtState& state) {
+    const char* on = std::getenv("STRATA_HIPBLASLT_WARMUP");
+    if (!on || *on == '0') return;
+    uint64_t warmed = 0;
+    for (const auto& row : state.table.rows()) {
+        const int64_t t = row.t_bucket;   // the row's own bucket: closest() then picks exactly this solution id
+        const size_t w_bytes = (size_t) row.k * (size_t) row.n * 2;
+        const size_t x_bytes = (size_t) row.k * (size_t) t * 2;
+        const size_t y_bytes = (size_t) row.ldy * (size_t) t * 4;
+        uint16_t* w = nullptr;
+        uint16_t* x = nullptr;
+        float* y = nullptr;
+        if (cudaMalloc(&w, w_bytes) != cudaSuccess || cudaMalloc(&x, x_bytes) != cudaSuccess ||
+            cudaMalloc(&y, y_bytes) != cudaSuccess) {
+            std::fprintf(stderr, "prefill gemm: Lt warmup: allocation failed for solution %d (n=%d k=%d); "
+                                 "that shape still loads lazily\n",
+                         row.solution_id, row.n, row.k);
+            (void) cudaGetLastError();
+            if (w) (void) cudaFree(w);
+            if (x) (void) cudaFree(x);
+            if (y) (void) cudaFree(y);
+            continue;
+        }
+        (void) cudaMemset(w, 0, w_bytes);
+        (void) cudaMemset(x, 0, x_bytes);
+        const bool ok = try_hipblaslt(&state, row.type, x, w, y, t, row.n, row.k, row.ldy, 0.0f, nullptr);
+        (void) cudaDeviceSynchronize();
+        (void) cudaFree(w);
+        (void) cudaFree(x);
+        (void) cudaFree(y);
+        if (ok) ++warmed;
+    }
+    std::fprintf(stderr, "prefill gemm: hipBLASLt warmup: %llu of %zu tuned shapes resolved and launched "
+                         "before the prompt\n",
+                 (unsigned long long) warmed, state.table.rows().size());
 }
 #endif
 

@@ -606,3 +606,30 @@ Boot protocol 5 (tools/hip/p1_boot_run5.sh): gate, traced engine under
 gdb (backtrace again if it still hangs), and on a PASS it chains
 python + marker + longfill on the same boot - a clean run does not
 degrade the APU, so a green boot is the whole P1 characterization.
+
+**Run 18 (2026-10-03 17:44, boot of 17:40): the pin did not help -
+and the backtrace says why it could not.**
+- "mapped pinned cache complement ready: resident 31.64 GiB,
+  pinned 31.64 GiB; page-locked and mapped" - the complement was
+  pinned from birth this time.
+- Same hang, same spot, same backtrace: main thread in
+  hsa_executable_freeze -> BlitKernel::SubmitLinearCopyCommand.
+  The complement's pages are not what is faulting.
+
+**The real trigger, identified from the tuning table:** the PLE
+projection shapes are rows 6-9 of tools/hip/gfx1103-hipblaslt-100401.txt
+(n=48/512, k=2560, ldy=96/512 - the per-token PLE GEMMs).  hipBLASLt
+loads its algorithms LAZILY on a shape's first matmul, and the first
+PLE-shape matmul of the run lands in the layer-1 PLE block, mid-prompt.
+That lazy code-object load is the hsa_executable_freeze in the
+backtrace; its blit deadlocks against the KFD fault handlers
+(KFD_IOC_MEMORY_PREFAULT).  The statically-linked kernel modules load
+fine at layer 0 (the alias MoE ran) - it is specifically the lazy
+hipBLASLt load mid-prompt that wedges.
+
+**Fix (opt-in, STRATA_HIPBLASLT_WARMUP=1):** one matmul per tuned row at
+"tuning enabled" time (before the prompt, calm state) - all three
+solution ids (5992/5387/5388) load at init, and the prompt's first
+matmul of each shape is a plain launch of an already-loaded algorithm.
+The dGPU path is untouched (no-op without the env var).  A/B stays
+cheap: dropping the env var reproduces the hang.

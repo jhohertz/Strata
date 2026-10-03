@@ -22,7 +22,7 @@ echo "== 2) engine alias arithmetic under gdb, traced  $(date +%H:%M:%S)"
 IDS=$(python3 -c "import json;print(json.load(open('/tmp/p0-out/smoke_ids.json'))['arithmetic'])")
 cat > /tmp/p1-envwrap.sh << 'W'
 #!/usr/bin/env bash
-export STRATA_IGPU_ALIAS=1 STRATA_TRACE=1 STRATA_HIPBLASLT_TUNING="$STRATA_T"
+export STRATA_IGPU_ALIAS=1 STRATA_TRACE=1 STRATA_HIPBLASLT_WARMUP=1 STRATA_HIPBLASLT_TUNING="$STRATA_T"
 exec /home/jhohertz/co/Strata/build-hip/strata "$@"
 W
 chmod +x /tmp/p1-envwrap.sh
@@ -79,7 +79,7 @@ echo "PASS: alias arithmetic"
 echo "== 3) python, marker, longfill (same boot)  $(date +%H:%M:%S)"
 for CASE in python marker longfill; do
   IDS=$(python3 -c "import json;print(json.load(open('/tmp/p0-out/smoke_ids.json'))['$CASE'])")
-  env STRATA_IGPU_ALIAS=1 STRATA_HIPBLASLT_TUNING="$PWD/tools/hip/gfx1103-hipblaslt-100401.txt" \
+  env STRATA_IGPU_ALIAS=1 STRATA_HIPBLASLT_WARMUP=1 STRATA_HIPBLASLT_TUNING="$PWD/tools/hip/gfx1103-hipblaslt-100401.txt" \
     timeout 900 ./build-hip/strata "${ARGS[@]}" --tokens "$IDS" > /tmp/p1-out/$CASE.out 2> /tmp/p1-out/$CASE.err
   RC2=$?
   if [ $RC2 -eq 0 ]; then
