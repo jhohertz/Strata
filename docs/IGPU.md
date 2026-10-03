@@ -341,3 +341,35 @@ whole mapped file cold (timed), an 8-thread CPU pass warms the cache and
 produces the reference checksum, pass 2 reads warm (timed).  Boot 5
 protocol: micro cold first (the cheap discriminator - no engine involved),
 then the engine run.
+
+**Run 4 (2026-10-02 23:29, boot 5): the cold micro faulted - cleanly.**
+`igpu_gtt_micro --file packs/qwen38-flash-next-q2_0/experts.bin` (the first
+GPU read of the 31.6 GiB file mapping on a fresh boot):
+`hipStreamSynchronize: an illegal memory access was encountered`.  No
+hang, no kill - the process self-terminated (exit 2), which is the mild
+end of the failure spectrum; the APU is still treated as possibly
+degraded and gets a reboot before more GPU work.
+
+This replaces "wedged queue" with the actual first fault: **the iGPU's
+KFD/GTT path cannot demand-fault a 31.6 GiB file mapping** (8 million 4K
+pages, cold).  In the engine the same fault lands in the middle of a long
+kernel stream, which is why it surfaced as the 99 % busy storm / dead
+queue instead of a clean error.  This also gives the 0.1.36 copy-path
+faults (`iq_dequant_gu_f16`, `prefill copy_i32`, 2 of 9 runs, moving
+site) a candidate root cause: any first-touch GTT fault the KFD path
+cannot serve is a launch failure, and which kernel it lands in depends on
+where the physical pages happened to land.
+
+Boot 6 protocol (one GPU budget, no kills planned):
+1. gate.
+2. **CPU-only** warm: `dd if=experts.bin of=/dev/null bs=8M` (no GPU).
+3. micro `--file` (now warm): if it passes, kernel reads of
+   RAM-backed file pages are fine and the fault was purely the cold
+   demand path -> the engine fix is a host pre-population at alias open
+   (~10 s sequential pass), the alias design stands.
+4. engine alias arithmetic (file already warm from step 2) - the full
+   P1 verdict.
+If step 3 faults even warm, the GTT does not cover that address range at
+all, and the alias target moves to a full 31.6 GiB anonymous-RAM
+complement (built once by the CPU at startup, SSD speed) instead of the
+file mapping - still zero H2D copies, still no pool work.
