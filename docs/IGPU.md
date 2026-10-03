@@ -172,3 +172,61 @@ more runs, which the machine rules forbid after a fault.
 `--expert-cache 0` must be documented (and probably fixed upstream) as "auto"
 for APU users: it silently sizes a 33.9 GiB arena on a box where `auto` is
 known to over-allocate (GFX1103.md already says "never auto").
+
+## P0 results (second boot, 2026-10-02 20:0x boot) - complete, all runs clean
+
+Gate green before each phase. Five engine runs and two micro runs, no faults.
+
+| run | config | prefill | decode | host streaming | streamed / resident |
+| --- | --- | --- | --- | --- | --- |
+| E1c arith, `STRATA_OLD_IQ_MMVQ=1`, cold | 6000 slots | 9.50 | 9.28 | 3.2 s / 4.6 s | 3,340 / 1,770 |
+| E1c longfill, `STRATA_OLD_IQ_MMVQ=1`, cold | 6000 slots | 36.81 | 19.22 | 20.7 s / 31.6 s | 29,494 / 10,244 |
+| E1a' longfill, default kernels, warm | 6000 slots | 37.95 | 19.52 | 20.1 s / 30.6 s | 29,494 / 10,244 |
+| E1b' longfill, warm | **500 slots** | 37.78 | 19.00 | 20.9 s / 30.8 s | **39,239** / 499 |
+| micro (1 GiB, 512 blocks) | - | - | - | H2D copy 35.8 GB/s | **GTT read 82.6 GB/s = VRAM read 82.6 GB/s**, checksums OK |
+
+Conclusions:
+
+1. **The kernels are exonerated.** The `STRATA_OLD_IQ_MMVQ=1` arm (0.1.29-era
+   single-token kernels) shows the same ~37 tok/s warm / ~35 cold as the 0.1.36
+   multi-token kernels, with identical host-streaming times. The -46 %
+   regression vs 0.1.29 (68.8 warm) is in the shared streaming/caching
+   machinery, not the kernels - and it is now reproducible at 37.1/37.7/37.95
+   across two boots.
+2. **Cache size is not a performance variable.** 500 slots (0.69 GiB) is
+   throughput-identical to 6,000 slots (7.72 GiB) while streaming 33 % more
+   fills (39,239 vs 29,494) - 54.1 GiB of blob traffic in the same 20.9 s as
+   40.7 GiB. Copy bandwidth is not the constraint; the **per-expert host work
+   is** (dequant + GEMV + issue, serialized through the pool workers). The
+   ~20 s host time is the floor of the current architecture on this APU.
+3. **The 0.1.36 prefill is ~20 s of pool/host expert work + ~11 s of GPU +
+   dense work.** 0.1.29's 68.8 tok/s corresponds to a much smaller host share
+   (its streaming was 1.26 s per the 0.1.29 A/B row); the 0.1.36 device-side
+   plan rework moved expert work onto the host path. The fault sites (both in
+   the fill machinery) sit in the same path.
+4. **GTT reads are free.** The kernel reads an anonymous host buffer at
+   exactly the VRAM-read rate (82.6 GB/s, flat over 9 iterations, checksums
+   exact), while the H2D copy that exists to put data "where the GPU can read
+   it" costs 35.8 GB/s for data already in that memory. MADV_HUGEPAGE was
+   refused and made no difference - 4 K pages over 1 GiB are fine.
+5. **Faults remain 3 total across two boots** (two identified sites in the
+   fill machinery, one in the 24,576-slot auto config); 9 subsequent engine
+   runs clean.
+
+**Revised P1 design (replaces "slot = 8-byte pointer into a 6000-slot table"):**
+the pointer table covers **all 24,576 experts** (24,576 x 8 B = 196 KiB on
+device), not a 6,000-slot subset. With every expert simultaneously
+"resident", the GPU computes **100 % of expert rows** and the CPU pool's
+expert work - the measured ~20 s - retires to zero (or the pool becomes a
+pure draft worker). The copy is only a symptom; the pool compute is the
+disease. The bandwidth math: the longfill's 9,296 expert rows read 12.8 GiB
+of blobs, ~0.16 s at the measured 82.6 GB/s; dense weights are read once.
+Expect prefill to land in the 100+ tok/s region (measured in P1, not
+promised), i.e. a 3-5x improvement over the current 37.8 and past 0.1.29's
+68.8 - on the iGPU path only, the dGPU copy path unchanged.
+
+P0 verdict: **the aliasing path is validated at the hardware level and the
+target is now quantified**. Next: P1 implementation on this branch
+(ExpertCache alias mode + full pointer table + the two resolution-kernel
+variants + `cudaDevAttrIntegrated` detection + `STRATA_IGPU_ALIAS` override),
+then the 3-pass smoke gate.
