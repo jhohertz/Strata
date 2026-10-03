@@ -50,10 +50,12 @@ GDBPID=$!
     kill -STOP "$EPID"
     sleep 12
     echo "set pagination off"
-    echo "thread apply all bt 12"
+    echo "thread apply 1 bt 40"
     sleep 30
-    echo "info threads"
-    sleep 8
+    echo "thread apply all bt 4"
+    sleep 20
+    echo "info proc mappings"
+    sleep 15
     echo "kill"
   fi
   sleep 8

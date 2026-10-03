@@ -2854,8 +2854,10 @@ int main(int argc, char** argv) {
                             {
                                 const uint64_t cbytes = file_src->resident_bytes();
                                 const uint8_t* cbase = file_src->complement_host();
+                                // 4 MiB target: run 20's 1 GiB target exhausted the iGPU's 16 GiB VRAM budget
+                                // (the H2D pass accounted against it) and the prompt's buffers then "did not fit".
                                 uint8_t* d_ping = nullptr;
-                                const size_t chunk = 1ull << 30;
+                                const size_t chunk = 4ull << 20;
                                 if (cbase != nullptr && cudaMalloc(&d_ping, chunk) == cudaSuccess) {
                                     const auto pf0 = std::chrono::steady_clock::now();
                                     bool ok = true;

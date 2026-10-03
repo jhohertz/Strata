@@ -660,3 +660,26 @@ recipe (a full H2D ping made its reads clean; a partial ping left the
 rest faulting, so registration alone is not enough for the driver's
 page tables).  ~1 s at the measured 36 GB/s, a 1 GiB temporary device
 buffer, logged on success/failure.
+
+**Run 20 (2026-10-03 18:49, boot of 18:47): the hang is GONE -
+replaced by a memory-exhaustion abort that reveals the iGPU's
+budget.**
+- The prefault pass worked: "one DMA read pass over 31.64 GiB in
+  898 ms" (35 GB/s, the measured H2D rate).
+- But the 1 GiB H2D target + the pass itself ran up the iGPU's VRAM
+  budget: the card's carve-out is **16 GiB** (mem_info_vram_total,
+  idle-used 164 MB), and prefill then reported "device buffers for a
+  chunk of 512 tokens do not fit" and aborted cleanly.  The
+  "unspecified launch failure" lines came during teardown
+  (hipModuleUnload) - a stale fault state, and they degrade the APU
+  like any fault.
+- Note: run 20 never reached the prompt, so it says nothing about the
+  layer-1 module-load deadlock.
+
+**Fixes for run 21:** the prefault's target is now 4 MiB (8,192 copies,
+~1 s at the same rate, ~zero VRAM footprint).  And the gdb forensics
+get the missing data if the layer-1 hang returns: `thread apply 1
+bt 40` (through the libamdhip64 frames to the engine-side caller, so
+the module load's identity is known - hipModuleLoadData = a
+BLAS JIT cubin vs. a static kernel TU) plus `info proc mappings` (to
+symbolize the library frames offline).
