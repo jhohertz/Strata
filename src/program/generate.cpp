@@ -5957,6 +5957,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: entering the token loop\n"); std::fflush(stderr); }   // igpu-rework P1 hang hunt
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();

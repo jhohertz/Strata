@@ -515,3 +515,23 @@ path reaches the same branch with zero alias machinery).
 `tools/hip/p1_boot_run2.sh` A/Bs it: copy path + `--expert-cache 50` +
 `STRATA_IGPU_ALIAS=0` + trace first (the cheap reproducer if it is the
 culprit), the alias run second.
+
+**Run 15 (2026-10-03 13:18, boot of 12:55): the A/B is decisive.**
+Copy path + `--expert-cache 50` (borrow=nullptr, the "own buffers" branch,
+`STRATA_IGPU_ALIAS=0`): **PASS** (prefill 6.64, decode 8.21 tok/s - slow
+on 50 slots, as expected).  The own-buffers branch is innocent.  The alias
+run timed out again, same spot ("prompt chunk 0 of 44").  The only
+material difference left: the alias prompt computes every expert through
+`gather_native` reading the **host complement pointers** (the copy path's
+resident computes read device-arena pointers).
+
+Next boot (tools/hip/p1_boot_run3.sh):
+1. micro `--scatter 32`: the engine's exact gather shape on a registered
+   region - 24,576 CTAs, each reading its own 1.38 MiB blob at a scattered
+   base (the complement's layout), one kernel.  A fault/hang here means
+   the KFD path cannot serve that pattern (the pattern-free full reads
+   pass) and the alias design bounces the prompt path (decode-only
+   aliasing).
+2. the engine, now with per-layer + chunk-done + token-loop traces
+   (STRATA_TRACE) - the last line before the silence names the hang
+   layer.

@@ -310,6 +310,67 @@ int run_reg_arm(long long gib, unsigned flags, const char* label) {
     return 0;
 }
 
+// P1 scatter arm: the engine's gather shape on a registered region - 24,576 CTAs, each reading its own
+// 1.38 MiB blob at a scattered base (the complement's exact block layout), one kernel, the way the prompt
+// path's gather_native walks the experts.  A hang/fault here means the KFD path cannot serve that pattern
+// (not the pattern-free full reads that pass), and the alias design must bounce the prompt path.
+__global__ void scatter_read_kernel(const uint4* __restrict__ region, long long region_words4, long long blob_words4,
+                                    long long n_blobs, uint32_t* partials, int n_partials) {
+    const long long b = blockIdx.x;
+    if (b >= n_blobs) return;
+    const long long base = b * blob_words4;
+    uint32_t acc = 0u;
+    for (long long i = threadIdx.x; i < blob_words4; i += blockDim.x) {
+        const uint4 v = region[base + i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    __shared__ uint32_t warp[32];
+    for (int off = 16; off > 0; off >>= 1) acc ^= __shfl_down_sync(0xffffffffu, acc, off);
+    if ((threadIdx.x & 31) == 0) warp[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        acc = (threadIdx.x < (blockDim.x >> 5)) ? warp[threadIdx.x] : 0u;
+        for (int off = 16; off > 0; off >>= 1) acc ^= __shfl_down_sync(0xffffffffu, acc, off);
+        if (threadIdx.x == 0) partials[b % (long long) n_partials] ^= acc;
+    }
+}
+
+int run_scatter_arm(long long gib) {
+    const long long bytes = gib * (1ll << 30);
+    uint8_t* host = (uint8_t*) std::malloc(bytes);
+    if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib); return 2; }
+    std::memset(host, 0x5a, bytes);
+    if (hipHostRegister(host, (size_t) bytes, hipHostRegisterDefault) != hipSuccess) {
+        std::fprintf(stderr, "igpu_gtt_micro: register: %s\n", hipGetErrorString(hipGetLastError()));
+        return 2;
+    }
+    // the complement's exact block layout: 1,382,400 B blobs, as many as fit
+    const long long blob = 1382400;
+    const long long n_blobs = bytes / blob;
+    const int n_partials = 1024;
+    uint32_t* d_partials = nullptr;
+    uint32_t* h_partials = (uint32_t*) std::malloc(n_partials * sizeof(uint32_t));
+    CHECK(hipMalloc(&d_partials, n_partials * sizeof(uint32_t)));
+    CHECK(hipMemsetAsync(d_partials, 0, n_partials * sizeof(uint32_t), 0));
+    std::printf("igpu_gtt_micro: scatter %lld GiB registered, %lld blobs x 1,382,400 B, one kernel\n", gib, n_blobs);
+    const auto t0 = std::chrono::steady_clock::now();
+    scatter_read_kernel<<<(unsigned) n_blobs, 256, 0, (hipStream_t) 0>>>((const uint4*) host, bytes / 16, blob / 16,
+                                                                         n_blobs, d_partials, n_partials);
+    CHECK(hipGetLastError());
+    CHECK(hipStreamSynchronize(0));
+    const long long ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(hipMemcpy(h_partials, d_partials, n_partials * sizeof(uint32_t), hipMemcpyDeviceToHost));
+    // every byte is 0x5a: each uint4 XORs to a fixed value; the answer is that value repeated (parity of counts)
+    uint32_t expect = 0x5a5a5a5a ^ 0x5a5a5a5a ^ 0x5a5a5a5a ^ 0x5a5a5a5a;   // = 0
+    std::printf("S-scatter  %7.1f GB/s  (%lld ms, partial-sum %08x)\n", (double) bytes / 1e9 / (ms / 1000.0),
+                (long long) ms, h_partials[0] ^ h_partials[1] ^ expect);
+    CHECK(hipFree(d_partials));
+    (void) hipHostUnregister(host);
+    std::printf("igpu_gtt_micro: scatter arm done\n");
+    return 0;
+}
+
 // P1 file arm: kernel reads of a whole mmap'd file, cold then warm, checksummed against the CPU.
 int run_file_arm(const char* path) {
     const int fd = ::open(path, O_RDONLY);
@@ -386,6 +447,8 @@ int main(int argc, char** argv) {
                                (unsigned) (hipHostRegisterMapped | hipHostRegisterPortable), "reg-mapped");
         if (std::strcmp(argv[i], "--reg-after-dma") == 0 && i + 1 < argc)
             return run_reg_after_dma_arm((long long) std::atof(argv[i + 1]));
+        if (std::strcmp(argv[i], "--scatter") == 0 && i + 1 < argc)
+            return run_scatter_arm((long long) std::atof(argv[i + 1]));
     }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;
     constexpr long long bytes = 1ll << 30;   // 1 GiB

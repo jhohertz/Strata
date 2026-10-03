@@ -1329,6 +1329,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
+            if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt layer %lld\n", (long long) l); std::fflush(stderr); }   // igpu-rework P1 hang hunt
             const core::LayerView v(*m.wt, l);
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
@@ -2048,6 +2049,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     if (next_run.valid() && !next_run.get()) { err = next_err; return false; }
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
+    if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr,
+        "strata trace: prompt done: %lld chunk(s), %lld resident expert computes, %lld staged\n",
+        (long long) stats_.chunks, (long long) stats_.experts_resident, (long long) stats_.experts_streamed); std::fflush(stderr); }   // igpu-rework P1 hang hunt
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         cudaStreamSynchronize(m.cs);
         auto bad = [&](const float* d, int64_t n) {
