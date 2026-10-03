@@ -399,3 +399,34 @@ All-pass outcome: one contiguous 31.6 GiB VMA is the problem -> chunk the
 alias open into several mmaps (e.g. 4 GiB each, pointers table updated
 per chunk) - a small, clean change.  A fault at step N pins the limit and
 the same chunking fix applies with the measured size.
+
+**Runs 6-7 (2026-10-02 23:39-23:40, boot 7): even a 1 GiB file slice
+faults - at both offsets.**  `--slice 30.6 1` (map 0x72c599200000) and
+`--slice 0 1` (map 0x7f4301600000): both `illegal memory access`.  And the
+260 MiB "mapped host memory" token embedding is **not a file VMA at all**
+- `NativeEmbed` is `cudaHostAlloc` (pinned anonymous) or VRAM.  So: **no
+kernel on this APU has ever read a file-backed VMA, and the ones that
+have all fault.**  The KFD/GTT path on gfx1103 + ROCm 10.0.0~pre4 maps
+anonymous (and pinned) host memory, not file mappings.  (This also means
+the P0 82.6 GB/s number is the correct expectation for the alias reads:
+they will run over anonymous RAM, exactly like the P0 arm.)
+
+**The fix, implemented:** the alias table points at the **full RAM
+complement** instead of the file.  The complement (`pin_cache_complement`)
+builds one anonymous arena holding the experts the GPU cache does not
+hold - so the alias open now pins it **before admitting any expert to the
+alias cache** (an empty residency makes the complement cover all 24,576
+experts; ~31.6 GiB, filled by the CPU at SSD speed, once, ~10-15 s), and
+`blob()` then prefers the complement over the file mapping from then on.
+The headroom is capped at 2 GiB for the alias run (the default 8 GiB -
+sized for the ordinary modes - would reject the 31.6 GiB complement on a
+45 GiB box).  Everything downstream (the pointer table, the kernels, the
+plans) is unchanged: they already read "the blob pointer", which is now
+anonymous RAM.
+
+Boot 8 protocol:
+1. gate.
+2. `--anon 32`: does the KFD path map a 32 GiB **anonymous** VMA (the
+   complement's shape)?  A fault means the arena must be chunked.
+3. engine alias arithmetic (no dd needed: the complement fills from NVMe
+   on the CPU at startup; the GPU never touches the file).

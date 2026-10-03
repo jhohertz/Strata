@@ -2801,6 +2801,37 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 if (okp) {
+                    // Measured on this APU (docs/IGPU.md): the KFD/GTT path cannot map a FILE-backed VMA to the
+                    // GPU at all - a 1 GiB file slice faults with an illegal access while anonymous regions of the
+                    // same address are read at 82.6 GB/s.  So the alias table must point at anonymous RAM, not the
+                    // file: build the full complement (every expert, one copy, ~the file's size in RAM) NOW, while
+                    // the cache's residency is still empty - an empty residency makes the complement cover all
+                    // experts - and blob() prefers the complement over the file mapping from then on.  Filled by
+                    // the CPU at SSD speed, once; from here on nothing in the run reads the file.
+                    // The complement is the run's biggest allocation (nothing after it is close), so the
+                    // default 8 GiB safety headroom - sized for the ordinary modes - would reject it on a
+                    // 45 GiB box; cap it at 2 GiB for the alias run.  Only the file source has a complement.
+                    auto* file_src = (srcp == &src) ? &src : nullptr;
+                    if (file_src == nullptr) {
+                        std::fprintf(stderr,
+                                     "strata generate: igpu alias cache: it needs the --mmap-experts file source "
+                                     "(its RAM complement); the copy path continues\n");
+                        xcache.close();
+                        okp = false;
+                    } else {
+                        const uint64_t alias_headroom = std::min<uint64_t>(o.resident_headroom, 2ull << 30);
+                        if (!file_src->pin_cache_complement(xcache, err, o.resident_pin, {}, -1, alias_headroom,
+                                                             o.resident_budget, nullptr)) {
+                            std::fprintf(stderr,
+                                         "strata generate: igpu alias cache: the full RAM complement could not be "
+                                         "built (%s); the copy path continues\n",
+                                         err.c_str());
+                            xcache.close();
+                            okp = false;
+                        }
+                    }
+                }
+                if (okp) {
                     std::vector<uint64_t> ptrs((size_t) g.n_layers * (size_t) g.n_expert, 0);
                     bool all = true;
                     for (int64_t l = 0; all && l < g.n_layers; ++l)
@@ -2814,8 +2845,9 @@ int main(int argc, char** argv) {
                     if (all) {
                         alias_opened = true;
                         std::fprintf(stderr,
-                                     "strata generate: IGPU ALIAS cache: %lld experts, one 64-bit host pointer each "
-                                     "(%.0f KiB of device memory, 0 GiB of blob copies);\n"
+                                     "strata generate: IGPU ALIAS cache: %lld experts, one 64-bit pointer each into "
+                                     "the RAM complement (table %.0f KiB of device memory; the complement itself is "
+                                     "in host RAM, which the iGPU reads at device rate);\n"
                                      "                 every expert is resident, so the GPU computes every expert row "
                                      "and the CPU pool sees no misses (docs/IGPU.md)\n",
                                      (long long) xcache.slots(), (double) xcache.bytes() / 1024.0);
