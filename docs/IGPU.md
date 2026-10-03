@@ -499,3 +499,19 @@ register_complement_for_gpu`).  `tools/hip/p1_boot_run.sh` runs the boot
 protocol: gate, `--reg-mapped 8`, `--reg-after-dma 8`, then the engine
 alias arithmetic (and, on a pass, python on the same boot - clean runs do
 not degrade the APU, so a green boot is a whole-smoke opportunity).
+
+**Run 14 (2026-10-03 12:38, boot of 12:23): registration is fully
+exonerated.**  `--reg-mapped 8` (the exact `Mapped|Portable` flags the
+engine used): PASS at 54.4 GB/s.  `--reg-after-dma 8` (a 1 MiB DMA first,
+register second - the engine's ordering): PASS.  Yet the engine alias run
+timed out again (same silence).  The KFD registration story is closed:
+the complement is readable, and the hang lives in the engine's code path.
+
+New suspect: the alias forces the prompt path's **borrow=nullptr
+("allocates its own buffers") branch** - the one branch the APU smoke has
+never taken (every run so far borrowed from a 6000-slot arena; the
+borrow math is `k+128 <= slots`, so `--expert-cache 50` on the plain COPY
+path reaches the same branch with zero alias machinery).
+`tools/hip/p1_boot_run2.sh` A/Bs it: copy path + `--expert-cache 50` +
+`STRATA_IGPU_ALIAS=0` + trace first (the cheap reproducer if it is the
+culprit), the alias run second.
