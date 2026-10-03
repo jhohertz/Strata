@@ -535,3 +535,12 @@ Next boot (tools/hip/p1_boot_run3.sh):
 2. the engine, now with per-layer + chunk-done + token-loop traces
    (STRATA_TRACE) - the last line before the silence names the hang
    layer.
+
+**Boot protocol 4 (tools/hip/p1_boot_run4.sh, the localizing boot):**
+gate; micro `--scatter 32` (fault here = the pattern is unserveable,
+decode-only aliasing is the design); then the traced engine **under gdb**
+(gdb is the parent, so ptrace_scope=1 allows the attach): if the engine
+hangs, gdb interrupts it at ~3 min and dumps `thread apply all bt 12` +
+`info threads`; if it completes, no interrupt is sent and the boot is
+preserved for a chained smoke.  One boot yields: the pattern answer, the
+last trace line (which phase), and the host backtrace (which call).
