@@ -544,3 +544,33 @@ hangs, gdb interrupts it at ~3 min and dumps `thread apply all bt 12` +
 `info threads`; if it completes, no interrupt is sent and the boot is
 preserved for a chained smoke.  One boot yields: the pattern answer, the
 last trace line (which phase), and the host backtrace (which call).
+
+**Run 16 (2026-10-03 15:41, boot of 15:18): the hang is LOCALIZED.**
+- micro `--scatter 32`: **PASS at 54.5 GB/s** - 24,855 CTAs each reading
+  their own 1.38 MiB blob on a registered 32 GiB, the engine's exact
+  gather shape.  The KFD path serves the gather pattern fine; hypothesis
+  (a) is dead.
+- traced engine: clean startup, complement copied (31.64 GiB) and
+  registered, "prompt chunk 0 of 44", "prompt layer 0", "prompt layer 1"
+  - then silence.  **The hang is inside layer 1's body.**  Layer 1 is the
+  PLE layer (the only layer with the PLE block: conv + table reads on the
+  28.8 GiB file-mapped GGUF).
+
+  What is new in alias mode at that point: 31.64 GiB of *pageable*
+  complement plus the 28.8 GiB PLE file mapping plus the 31.64 GiB expert
+  file mapping, with **8.14 GiB free** (traced).  The copy-50 run passed
+  the same layer with a 69 MiB arena and ~40 GiB free.  Prime suspect:
+  page fault / direct reclaim pressure around the PLE file-page path
+  while 31.64 GiB of anonymous pages sit in the reclaim path.
+
+  (The gdb run in this boot never attached: `-batch` gdb does not read
+  the interrupt off stdin while `run` blocks.  Fixed: interactive gdb,
+  the feeder SIGSTOPs the engine - not SIGINT, which could exit it -
+  then `thread apply all bt 12` + `info threads` + `kill`, with correct
+  timeout->gdb->engine PID walking and a 900 s process-group backstop.)
+
+The engine now also traces inside the layer body: "PLE block done",
+"attn+mlp done, experts begin", "moe done" (per layer, STRATA_TRACE) -
+so the next run names the exact stage of layer 1, and the gdb
+backtrace says whether the host is stuck in a page fault / reclaim or
+the GPU is stuck in a kernel.

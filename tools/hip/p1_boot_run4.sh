@@ -32,39 +32,41 @@ W
 chmod +x /tmp/p1-envwrap.sh
 rm -f /tmp/gdbfifo; mkfifo /tmp/gdbfifo
 OUT=/tmp/p1-out/gdb.out
+# interactive gdb (NOT -batch: in batch mode a hung `run` never reads the interrupt off stdin).
+# timeout is the backstop: it signals the whole process group, so a wedged gdb cannot hold the script.
 env STRATA_T="$PWD/tools/hip/gfx1103-hipblaslt-100401.txt" \
-  gdb -q -nx --args /tmp/p1-envwrap.sh "${ARGS[@]}" --tokens "$IDS" \
+  timeout 900 gdb -q -nx -ex 'set debuginfod enabled off' -ex 'set pagination off' -ex 'set confirm off' -ex run \
+     --args bash /tmp/p1-envwrap.sh "${ARGS[@]}" --tokens "$IDS" \
   < /tmp/gdbfifo > "$OUT" 2>&1 &
 GDBPID=$!
 (
   sleep 30
-  EPID=$(pgrep -P "$GDBPID" | head -1)
+  # GDBPID is the `timeout` process; its child is gdb; gdb's child is the engine (the wrapper execs in place)
+  GDBREAL=$(pgrep -P "$GDBPID" | head -1)
+  EPID=$(pgrep -P "$GDBREAL" | head -1)
   hung=0
-  for _ in $(seq 1 15); do                 # up to ~3 min of hang before we interrupt
-    kill -0 "$EPID" 2>/dev/null || { echo "engine finished early - no interrupt"; break; }
+  for _ in $(seq 1 15); do                 # up to ~3 min of hang before we stop it
+    kill -0 "$EPID" 2>/dev/null || { echo "engine finished early - no stop" >&2; break; }
     sleep 12
-    if kill -0 "$EPID" 2>/dev/null; then
-      # it is still alive after 3 min: is it working or hung?  the APU is cheap to check
-      B=$(cat /sys/class/drm/card1/device/gpu_busy_percent 2>/dev/null || echo 0)
-      echo "probe: engine alive, gpu_busy=$B"
-    fi
   done
   if kill -0 "$EPID" 2>/dev/null; then
-    echo "hung - interrupting via gdb"
-    echo "set pagination off"
-    echo "interrupt"
+    echo "hung (engine pid $EPID) - SIGSTOP, then gdb backtrace, then kill" >&2
+    kill -STOP "$EPID"
     sleep 12
+    echo "set pagination off"
     echo "thread apply all bt 12"
-    sleep 25
+    sleep 30
     echo "info threads"
-    sleep 5
-    echo "quit"
+    sleep 8
+    echo "kill"
   fi
-  sleep 3
+  sleep 8
 ) > /tmp/gdbfifo &
 FEEDPID=$!
 wait "$GDBPID" 2>/dev/null
+GDBRC=$?
 kill "$FEEDPID" 2>/dev/null; wait "$FEEDPID" 2>/dev/null
+echo "(gdb exit: $GDBRC; 124 = the 900 s backstop fired)"
 echo "---- engine result lines ----"
 grep -E 'decode +160|prefill +4[0-9]|illegal|unspecified|FAIL' "$OUT" | head -4
 echo "---- last trace lines ----"

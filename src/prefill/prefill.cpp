@@ -1401,6 +1401,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: layer %lld PLE block done\n", (long long) l); std::fflush(stderr); }   // igpu-rework P1 hang hunt
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
                 if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
@@ -1750,6 +1751,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                             cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                         }
+                        if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: layer %lld attn+mlp done, experts begin\n", (long long) l); std::fflush(stderr); }   // igpu-rework P1 hang hunt
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
                         std::vector<int32_t> order;
                         for (int32_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0) order.push_back(e);
@@ -1946,6 +1948,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     pt.mark(kPfCombine, cs);
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: layer %lld moe done\n", (long long) l); std::fflush(stderr); }   // igpu-rework P1 hang hunt
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
