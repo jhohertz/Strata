@@ -633,3 +633,30 @@ solution ids (5992/5387/5388) load at init, and the prompt's first
 matmul of each shape is a plain launch of an already-loaded algorithm.
 The dGPU path is untouched (no-op without the env var).  A/B stays
 cheap: dropping the env var reproduces the hang.
+
+**Run 19 (2026-10-03 18:27, boot of 18:00): the warmup did not
+help either - which narrows the story further.**
+- "hipBLASLt warmup: 9 of 9 tuned shapes resolved and launched before
+  the prompt" - all nine tuned algorithms (solution ids 5992/5387/5388)
+  loaded at init, in a calm state, without incident.
+- Same hang, same backtrace (hsa_executable_freeze ->
+  BlitKernel::SubmitLinearCopyCommand; two runtime threads in
+  KFD_IOC_MEMORY_PREFAULT).  The layer-1 module load is not a tuned
+  hipBLASLt algorithm.
+
+  The consistent picture across runs 16-19: in alias mode the layer-0
+  gather kernel reads all 31.64 GiB of the complement in a few seconds,
+  which leaves the driver's fault handlers busy for minutes installing
+  the complement's GTT page tables (they are lazy even when the region
+  is page-locked).  Whatever module load lands while that drain is still
+  running deadlocks its code-object blit against the KFD lock held by
+  the fault handlers.  The copy-50 run never hit it: its complement's
+  page tables are installed in 24,526 small DMA reads spread over 20 s
+  (the pool streaming), never a storm.
+
+**Fix (run 19, in the tree):** a full DMA read pass over the
+complement right after it is built and registered - the micro's proven
+recipe (a full H2D ping made its reads clean; a partial ping left the
+rest faulting, so registration alone is not enough for the driver's
+page tables).  ~1 s at the measured 36 GB/s, a 1 GiB temporary device
+buffer, logged on success/failure.

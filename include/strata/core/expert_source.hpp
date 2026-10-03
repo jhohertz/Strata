@@ -437,6 +437,7 @@ public:
     int64_t blobs() const { return blobs_; }
     uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
     uint64_t resident_bytes() const { return complement_bytes_; }
+    const uint8_t* complement_host() const { return complement_host_; }   // igpu-rework P1: the RAM complement's base
     bool complement_pinned() const { return complement_pinned_; }
     /// igpu-rework (docs/IGPU.md): the iGPU's KFD/GTT path faults a kernel read of any host VMA the driver
     /// has never seen - measured: unregistered regions fault at every size and for file mappings alike,

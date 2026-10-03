@@ -2843,6 +2843,43 @@ int main(int argc, char** argv) {
                                          "strata generate: the %.2f GiB expert complement is registered for direct "
                                          "kernel reads (no H2D copies)\n",
                                          (double) file_src->resident_bytes() / 1073741824.0);
+                            // igpu-rework P1 run 19: registration and page-locking still leave the complement's GTT
+                            // page tables lazy: the first kernel read of 31.6 GiB starts a driver page-fault storm
+                            // (the two HSA fault-handler threads sit in KFD_IOC_MEMORY_PREFAULT for minutes), and a
+                            // kernel-module load that lands while the storm is draining deadlocks its code-object
+                            // blit (hsa_executable_freeze -> BlitKernel::SubmitLinearCopyCommand - the backtraces of
+                            // runs 16-18).  One DMA read pass over the whole complement installs every page table
+                            // entry before the prompt (the micro's recipe: a full H2D ping is what made its reads
+                            // clean; a partial one left the rest faulting).  ~1 s at the measured 36 GB/s.
+                            {
+                                const uint64_t cbytes = file_src->resident_bytes();
+                                const uint8_t* cbase = file_src->complement_host();
+                                uint8_t* d_ping = nullptr;
+                                const size_t chunk = 1ull << 30;
+                                if (cbase != nullptr && cudaMalloc(&d_ping, chunk) == cudaSuccess) {
+                                    const auto pf0 = std::chrono::steady_clock::now();
+                                    bool ok = true;
+                                    for (uint64_t off = 0; off < cbytes; off += chunk) {
+                                        const size_t b = (size_t) std::min<uint64_t>(chunk, cbytes - off);
+                                        if (cudaMemcpy(d_ping, cbase + off, b, cudaMemcpyHostToDevice) != cudaSuccess) {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                    (void) cudaDeviceSynchronize();
+                                    (void) cudaFree(d_ping);
+                                    if (ok)
+                                        std::fprintf(stderr, "strata generate: the complement's GTT page tables are "
+                                                             "prefaulted: one DMA read pass over %.2f GiB in %lld ms\n",
+                                                     (double) cbytes / 1073741824.0, (long long) std::chrono::
+                                     duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - pf0)
+                                     .count());
+                                    else
+                                        std::fprintf(stderr,
+                                                     "strata generate: WARNING: the complement prefault pass failed "
+                                                     "(first kernel reads install page tables lazily)\n");
+                                }
+                            }
                         }
                     }
                 }
