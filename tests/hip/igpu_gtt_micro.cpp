@@ -9,6 +9,11 @@
 //   A' same, with MADV_HUGEPAGE (--thp) - large pages for the GPU's TLB
 //   B  hipMalloc buffer, pre-filled by an H2D copy (the copy path's steady state)
 //   C  CPU memcpy of the same size - the copy cost itself, for reference
+//   F  --file <path>: the kernel reads a whole mmap'd file.  Run it once on a cold page cache
+//      (fresh boot, nothing has touched the file): pass 1 faults every page through the KFD/GTT
+//      path for the first time (cold, timed), the CPU reference pass then warms the cache, and
+//      pass 2 is the warm kernel read (timed).  A hang on pass 1 with a clean pass 2 is the
+//      P1 wedge signature (docs/IGPU.md): the GPU-side first touch of a big GTT-mapped file.
 //
 // Prints GB/s per arm (median and min/max over the iterations) and the checksum verdict.
 #include <hip/hip_runtime.h>
@@ -20,7 +25,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
 
 #define CHECK(call)                                                                                                  \
     do {                                                                                                             \
@@ -88,7 +98,66 @@ void report(const char* arm, const uint8_t* cpu_src, long long bytes, const uint
 
 }  // namespace
 
+// P1 file arm: kernel reads of a whole mmap'd file, cold then warm, checksummed against the CPU.
+int run_file_arm(const char* path) {
+    const int fd = ::open(path, O_RDONLY);
+    if (fd < 0) { std::perror("igpu_gtt_micro: open"); return 2; }
+    struct stat st = {};
+    if (fstat(fd, &st) != 0) { std::perror("igpu_gtt_micro: fstat"); return 2; }
+    const long long bytes = (long long) st.st_size & ~15LL;
+    if (bytes <= 0) { std::fprintf(stderr, "igpu_gtt_micro: file too small\n"); return 2; }
+    uint8_t* map = (uint8_t*) mmap(nullptr, (size_t) bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) { std::perror("igpu_gtt_micro: mmap"); return 2; }
+    std::printf("igpu_gtt_micro: file %s = %.2f GiB mapped read-only (run cold: fresh boot, nothing touched it)\n",
+                path, (double) bytes / 1073741824.0);
+
+    const int kBlocks = 1024;
+    uint32_t* h_partials = (uint32_t*) std::malloc(kBlocks * sizeof(uint32_t));
+    uint32_t* d_partials = nullptr;
+    CHECK(hipMalloc(&d_partials, kBlocks * sizeof(uint32_t)));
+    const long long n4 = bytes / 16;
+
+    // CPU reference (8 threads over the page cache; also warms it for pass 2)
+    uint32_t ref = 0u;
+    {
+        const long long nwords = bytes / 4, per = (nwords + 7) / 8;
+        std::vector<uint32_t> partial(8, 0u);
+        std::vector<std::thread> pool;
+        for (int t = 0; t < 8; ++t) {
+            pool.emplace_back([t, per, nwords, w = (const uint32_t*) map, &partial] {
+                uint32_t a = 0u;
+                for (long long i = (long long) t * per; i < (t == 7 ? nwords : (long long) (t + 1) * per); i++) a ^= w[i];
+                partial[t] = a;
+            });
+        }
+        for (auto& t : pool) t.join();
+        for (uint32_t a : partial) ref ^= a;
+    }
+    auto pass = [&](const char* label) -> bool {
+        CHECK(hipMemsetAsync(d_partials, 0, kBlocks * sizeof(uint32_t), 0));
+        const auto t0 = std::chrono::steady_clock::now();
+        xor_read_kernel<<<kBlocks, 256, 0, (hipStream_t) 0>>>((const float4*) map, n4, d_partials);
+        CHECK(hipGetLastError());
+        CHECK(hipStreamSynchronize(0));
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(hipMemcpy(h_partials, d_partials, kBlocks * sizeof(uint32_t), hipMemcpyDeviceToHost));
+        uint32_t got = 0u;
+        for (int b = 0; b < kBlocks; ++b) got ^= h_partials[b];
+        std::printf("F%s   checksum %-3s  %7.1f GB/s  (%lld ms for %.2f GiB)\n", label, got == ref ? "OK" : "MISMATCH",
+                    (double) bytes / 1e9 / (ms / 1000.0), (long long) ms, (double) bytes / 1073741824.0);
+        return got == ref;
+    };
+    const bool ok1 = pass("1-cold");
+    const bool ok2 = pass("2-warm");
+    CHECK(hipFree(d_partials));
+    munmap(map, (size_t) bytes);
+    std::printf("igpu_gtt_micro: file arm done (cold %s, warm %s)\n", ok1 ? "OK" : "BAD", ok2 ? "OK" : "BAD");
+    return ok1 && ok2 ? 0 : 3;
+}
+
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--file") == 0 && i + 1 < argc) return run_file_arm(argv[i + 1]);
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;
     constexpr long long bytes = 1ll << 30;   // 1 GiB
     constexpr int kBlocks = 512;

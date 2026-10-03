@@ -308,3 +308,36 @@ Experiment ladder for the next two boots:
   `MADV_POPULATE_READ` on the mapping) - the alias design stands. If run B
   hangs identically, it is sustained GTT kernel reads that wedge, and the
   strategy changes (bounce-buffer the prompt path, keep decode aliasing).
+
+**Run 3 forensics (2026-10-02 23:13-23:27, boot 4, the same hang, twice
+sampled - gdb is blocked by yama ptrace_scope without root, so wchan +
+gpu_busy_percent did the work):**
+
+- Phase 1 (23:12-23:22): main thread state **R** (running, not parked in a
+  sync), iGPU **99 % busy**, pool/stager threads idle in futex.
+- Phase 2 (23:22-23:27+): main thread still R (11 min of CPU time), iGPU
+  **0 % busy** - the KFD queue died while the host keeps polling it.
+- No "FileExpertSource: allocating ... GiB cache complement" line in the
+  log: the complement RAM copy is **not** built in this configuration, so
+  `blob(l,e)` returns the **mmap'd file pointer itself** - the kernel reads
+  the 31.6 GiB `experts.bin` mapping **cold from NVMe, page by page, for
+  the first time through the KFD/GTT path**.
+
+That is the mechanism: 31.6 GiB = 8 million 4K pages. The copy path never
+puts the GPU on that path (the pool's CPU reads fault the pages in at SSD
+speed first; the kernel then reads warm RAM). A KFD fault at roughly
+1 ms/page is hours, not seconds - phase 1 was that storm (or its wedge),
+and phase 2 is the queue that stopped producing. Every bounded spin in the
+prompt path was ruled out by reading: `Stager::wait` and `wait_issued`
+only run for non-resident entries (all 24,576 are resident, the log says
+so), the verify window self-times-out at 20 s, and the D-5 issuer thread
+exits immediately on an empty seq.
+
+**The fix, if the cold/warm micro confirms it, is one call:** pre-populate
+the file's pages on the host at alias open (a sequential read pass, or
+`madvise(MADV_POPULATE_READ)` on the mapping) - ~10 s once per boot.
+`igpu_gtt_micro` gained a `--file` arm for exactly this: pass 1 reads the
+whole mapped file cold (timed), an 8-thread CPU pass warms the cache and
+produces the reference checksum, pass 2 reads warm (timed).  Boot 5
+protocol: micro cold first (the cheap discriminator - no engine involved),
+then the engine run.
