@@ -373,3 +373,29 @@ If step 3 faults even warm, the GTT does not cover that address range at
 all, and the alias target moves to a full 31.6 GiB anonymous-RAM
 complement (built once by the CPU at startup, SSD speed) instead of the
 file mapping - still zero H2D copies, still no pool work.
+
+**Run 5 (2026-10-02 23:33, boot 6): warm, it faults too.**
+Gate green; `dd` read the 31.6 GiB in 6.7 s (CPU-only, page cache warm);
+the micro's full-file kernel read: `illegal memory access` again.  So the
+cold/warm question is settled - **it is the mapping, not the page state.**
+The data now: 1 GiB anonymous VMA (high user VA, ~0x7622...) = 82.6 GB/s
+clean (P0); 260 MiB file VMA (the embedding table, same VA region) = clean
+(every run); one 31.64 GiB file VMA at 0x762298400000-0x762a81400000 =
+illegal access.  The remaining variable is the per-VMA size (or size
+times type).
+
+Boot 7 protocol - binary-search the per-VMA limit with file **slices**
+(the micro gained `--slice <file> <off_gib> <size_gib>`: one VMA over
+[off, off+size), one kernel read, checksummed, and `--anon <gib>` for the
+anonymous-complement question).  Each PASS costs seconds; the first FAULT
+costs the boot and brackets the limit from below.  Order:
+  1. --slice 30.6 1     (1 GiB at the tail of the file)
+  2. --slice 0 1        (1 GiB at the head)
+  3. --slice 23.6 8     (8 GiB)
+  4. --slice 15.8 16    (16 GiB)
+  5. --slice 0 31       (31 GiB, near-full)
+  6. --anon 32          (the fallback design's viability)
+All-pass outcome: one contiguous 31.6 GiB VMA is the problem -> chunk the
+alias open into several mmaps (e.g. 4 GiB each, pointers table updated
+per chunk) - a small, clean change.  A fault at step N pins the limit and
+the same chunking fix applies with the measured size.

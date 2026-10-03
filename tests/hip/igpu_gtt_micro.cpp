@@ -98,6 +98,73 @@ void report(const char* arm, const uint8_t* cpu_src, long long bytes, const uint
 
 }  // namespace
 
+// P1 slice arm: one VMA over [off, off+len) of the file, kernel-read once, checksummed.  Maps a
+// per-VMA size question (a single 31.6 GiB VMA faults on this APU; do smaller ones, at any file
+// position, pass?).  Run several in one boot: a PASS costs ~seconds, a FAULT costs the boot,
+// so order them to bracket the limit and stop at the first fault.
+int run_slice_arm(const char* path, long long off, long long len) {
+    const int fd = ::open(path, O_RDONLY);
+    if (fd < 0) { std::perror("igpu_gtt_micro: open"); return 2; }
+    off &= ~0xfffull;   // page-align the offset
+    len &= ~0xfffull;
+    uint8_t* map = (uint8_t*) mmap(nullptr, (size_t) len, PROT_READ, MAP_PRIVATE, fd, (off_t) off);
+    if (map == MAP_FAILED) { std::perror("igpu_gtt_micro: mmap slice"); return 2; }
+    std::printf("igpu_gtt_micro: slice [%.2f GiB, +%.2f GiB) map=%p (one VMA)\n", (double) off / 1073741824.0,
+                (double) len / 1073741824.0, (void*) map);
+    const int kBlocks = 512;
+    uint32_t* h_partials = (uint32_t*) std::malloc(kBlocks * sizeof(uint32_t));
+    uint32_t* d_partials = nullptr;
+    CHECK(hipMalloc(&d_partials, kBlocks * sizeof(uint32_t)));
+    const long long n4 = len / 16;
+    CHECK(hipMemsetAsync(d_partials, 0, kBlocks * sizeof(uint32_t), 0));
+    const auto t0 = std::chrono::steady_clock::now();
+    xor_read_kernel<<<kBlocks, 256, 0, (hipStream_t) 0>>>((const float4*) map, n4, d_partials);
+    CHECK(hipGetLastError());
+    CHECK(hipStreamSynchronize(0));
+    const long long ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(hipMemcpy(h_partials, d_partials, kBlocks * sizeof(uint32_t), hipMemcpyDeviceToHost));
+    uint32_t got = 0u;
+    for (int b = 0; b < kBlocks; ++b) got ^= h_partials[b];
+    // CPU reference over the same slice (single thread is fine: the slice is small)
+    uint32_t ref = 0u;
+    const uint32_t* w = (const uint32_t*) map;
+    for (long long i = 0; i < len / 4; i += 4096) {
+        uint32_t a = 0;
+        for (long long k = i; k < i + 4096; k++) a ^= w[k];
+        ref ^= a;
+    }
+    std::printf("F-slice checksum %-3s  %7.1f GB/s  (%lld ms)\n", got == ref ? "OK" : "MISMATCH",
+                (double) len / 1e9 / (ms / 1000.0), (long long) ms);
+    CHECK(hipFree(d_partials));
+    munmap(map, (size_t) len);
+    return got == ref ? 0 : 3;
+}
+
+// P1 anon arm: a large anonymous region (the complement-fallback question: does the KFD path map a
+// big anonymous VMA at all?).  malloc + touch, one kernel read, no checksum (contents are a pattern).
+int run_anon_arm(long long gib) {
+    const long long bytes = gib * (1ll << 30);
+    uint8_t* host = (uint8_t*) std::malloc(bytes);
+    if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib); return 2; }
+    for (long long i = 0; i < bytes; i += 4096) host[i] = 0x5a;   // touch: real pages
+    std::printf("igpu_gtt_micro: anon %lld GiB map=%p\n", gib, (void*) host);
+    const int kBlocks = 512;
+    uint32_t* d_partials = nullptr;
+    CHECK(hipMalloc(&d_partials, kBlocks * sizeof(uint32_t)));
+    CHECK(hipMemsetAsync(d_partials, 0, kBlocks * sizeof(uint32_t), 0));
+    const auto t0 = std::chrono::steady_clock::now();
+    xor_read_kernel<<<kBlocks, 256, 0, (hipStream_t) 0>>>((const float4*) host, bytes / 16, d_partials);
+    CHECK(hipGetLastError());
+    CHECK(hipStreamSynchronize(0));
+    const long long ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("A-anon   %7.1f GB/s  (%lld ms for %lld GiB)\n", (double) bytes / 1e9 / (ms / 1000.0), (long long) ms,
+                gib);
+    CHECK(hipFree(d_partials));
+    return 0;
+}
+
 // P1 file arm: kernel reads of a whole mmap'd file, cold then warm, checksummed against the CPU.
 int run_file_arm(const char* path) {
     const int fd = ::open(path, O_RDONLY);
@@ -156,8 +223,14 @@ int run_file_arm(const char* path) {
 }
 
 int main(int argc, char** argv) {
-    for (int i = 1; i < argc; ++i)
+    for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--file") == 0 && i + 1 < argc) return run_file_arm(argv[i + 1]);
+        if (std::strcmp(argv[i], "--slice") == 0 && i + 3 < argc)
+            return run_slice_arm(argv[i + 1], (long long) std::atof(argv[i + 2]) * (1ll << 30),
+                                 (long long) std::atof(argv[i + 3]) * (1ll << 30));
+        if (std::strcmp(argv[i], "--anon") == 0 && i + 1 < argc)
+            return run_anon_arm((long long) std::atof(argv[i + 1]));
+    }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;
     constexpr long long bytes = 1ll << 30;   // 1 GiB
     constexpr int kBlocks = 512;
