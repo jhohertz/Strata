@@ -1914,10 +1914,11 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                                               cs);
         if (d.hit_cpu_order)
             strata::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
-                d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
+                d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale, nullptr,
+                d.cache_blob_ptrs);
         else
             strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
-                d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
+                d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale, d.cache_blob_ptrs);
         d.hit_pending = true;
         if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
         // The A/B arm: ONE driver entry here, and nothing else changes.  If the work was waiting for the host

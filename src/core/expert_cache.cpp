@@ -266,6 +266,65 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     return true;
 }
 
+bool ExpertCache::open_aliased(int64_t n_layers, int64_t n_expert, std::string& err) {
+    if (n_layers <= 0 || n_expert <= 0) {
+        err = "ExpertCache::open_aliased: needs at least one layer and one expert";
+        return false;
+    }
+    const int64_t n = n_layers * n_expert;
+    if (cudaMalloc((void**) &d_ptrs_, (size_t) n * sizeof(uint64_t)) != cudaSuccess) {
+        char buf[200];
+        std::snprintf(buf, sizeof buf,
+                      "ExpertCache::open_aliased: the %lld-pointer table (%.0f KiB) failed to allocate: %s",
+                      (long long) n, (double) n * 8 / 1024.0, cudaGetErrorString(cudaGetLastError()));
+        err = buf;
+        return false;
+    }
+    h_ptrs_.assign((size_t) n, 0);
+    residency_.assign((size_t) n, kNotResident);
+    alias_ = true;
+    slots_ = n;                        // one slot per (layer, expert): every expert resident
+    n_layers_ = n_layers;
+    n_expert_ = n_expert;
+    blob_ = 8;                         // bytes() reports the pointer table, the cache's true device size
+    next_free_ = 0;
+    fills_ = 0;
+    admitted_ = 0;
+    layer_next_.assign((size_t) n_layers, 0);
+    return true;
+}
+
+bool ExpertCache::set_aliased_pointers(const uint64_t* host_pointers, std::string& err) {
+    if (!alias_ || host_pointers == nullptr) {
+        err = "ExpertCache::set_aliased_pointers: no alias table, or no pointers";
+        return false;
+    }
+    const size_t n = (size_t) slots_;
+    if (cudaMemcpy(d_ptrs_, host_pointers, n * sizeof(uint64_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = std::string("ExpertCache::set_aliased_pointers: the upload failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    // Read it back and prove the upload: a pointer table that lies about a single index produces a plausible
+    // token, which is this project's most expensive failure mode.
+    std::vector<uint64_t> got(n);
+    if (cudaMemcpy(got.data(), d_ptrs_, n * sizeof(uint64_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = std::string("ExpertCache::set_aliased_pointers: the read-back failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (got[i] == 0 || got[i] != host_pointers[i]) {
+            char buf[200];
+            std::snprintf(buf, sizeof buf,
+                          "ExpertCache::set_aliased_pointers: slot %llu read back as 0x%llx (0x%llx expected)",
+                          (unsigned long long) i, (unsigned long long) got[i], (unsigned long long) host_pointers[i]);
+            err = buf;
+            return false;
+        }
+    }
+    fills_ = (int64_t) n;
+    return true;
+}
+
 void ExpertCache::close() {
 #if defined(STRATA_USE_HIP)
     if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
@@ -273,6 +332,12 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
+    if (d_ptrs_ != nullptr) {
+        cudaFree(d_ptrs_);
+        d_ptrs_ = nullptr;
+    }
+    h_ptrs_.clear();
+    alias_ = false;
     if (base_ != nullptr) {
         cudaFree(base_);
         base_ = nullptr;
@@ -326,17 +391,39 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
     if (slot < 0 || slot >= slots_) return nullptr;
+    if (alias_) return (uint8_t*) (uintptr_t) h_ptrs_[(size_t) slot];
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     if (slot < 0 || slot >= slots_) return nullptr;
+    if (alias_) return (const uint8_t*) (uintptr_t) h_ptrs_[(size_t) slot];
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
+    if (alias_) {   // the "fill" of an alias slot is an 8-byte pointer upload, not a blob copy
+        if (slot < 0 || slot >= slots_) {
+            err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
+                  std::to_string(slots_ - 1);
+            return false;
+        }
+        if (host_blob == nullptr) {
+            err = "ExpertCache::fill_slot: the host blob is null";
+            return false;
+        }
+        h_ptrs_[(size_t) slot] = (uint64_t) (uintptr_t) host_blob;
+        const cudaError_t e = cudaMemcpyAsync(d_ptrs_ + slot, h_ptrs_.data() + (size_t) slot, sizeof(uint64_t),
+                                              cudaMemcpyHostToDevice, (cudaStream_t) stream);
+        if (e != cudaSuccess) {
+            err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
+            return false;
+        }
+        ++fills_;
+        return true;
+    }
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -359,6 +446,25 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+    if (alias_) {
+        if (slot < 0 || slot >= slots_) {
+            err = "ExpertCache::fill_slot_blocking: slot outside the table";
+            return false;
+        }
+        if (host_blob == nullptr) {
+            err = "ExpertCache::fill_slot_blocking: the host blob is null";
+            return false;
+        }
+        h_ptrs_[(size_t) slot] = (uint64_t) (uintptr_t) host_blob;
+        const cudaError_t e = cudaMemcpy(d_ptrs_ + slot, h_ptrs_.data() + (size_t) slot, sizeof(uint64_t),
+                                         cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) {
+            err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
+            return false;
+        }
+        ++fills_;
+        return true;
+    }
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -390,6 +496,25 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 }
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+    if (alias_) {
+        if (slot < 0 || slot >= slots_) {
+            err = "ExpertCache::fill_slot_queued: slot outside the table";
+            return false;
+        }
+        if (host_blob == nullptr) {
+            err = "ExpertCache::fill_slot_queued: the host blob is null";
+            return false;
+        }
+        h_ptrs_[(size_t) slot] = (uint64_t) (uintptr_t) host_blob;
+        const cudaError_t e = cudaMemcpyAsync(d_ptrs_ + slot, h_ptrs_.data() + (size_t) slot, sizeof(uint64_t),
+                                              cudaMemcpyHostToDevice, (cudaStream_t) 0);
+        if (e != cudaSuccess) {
+            err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
+            return false;
+        }
+        ++fills_;
+        return true;
+    }
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {

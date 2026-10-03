@@ -255,6 +255,7 @@ struct ExpertDispatch {
     const uint8_t* cache_base = nullptr;   ///< the slot arena on the DEVICE
     int64_t cache_blob = 0;                ///< bytes per slot
     const uint64_t* cache_slot_off = nullptr;   ///< plan v0.3 P6: per-slot offsets when the slots differ in size
+    const uint64_t* cache_blob_ptrs = nullptr;  ///< igpu-rework: per-slot host pointers (alias cache; null: the arena)
     void* hit_scratch = nullptr;           ///< `moe_hit_grouped_scratch_bytes(K, ...)`
     float* parts_out = nullptr;            ///< the graph's `parts` buffer, on the device
     /// Where the GPU's hits land, `K x n_embd`, DEVICE and separate from `parts_out` on purpose: see

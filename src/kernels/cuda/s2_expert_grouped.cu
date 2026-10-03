@@ -122,7 +122,8 @@ __global__ void gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* 
                           long long blob_bytes, const uint8_t* __restrict__ x_q8_0,
                           const float* __restrict__ x_scales, float* __restrict__ gate_up, int n_hits,
                           const int32_t* __restrict__ d_count = nullptr,
-                          const int32_t* __restrict__ dst_index = nullptr, int tok_div = 0) {
+                          const int32_t* __restrict__ dst_index = nullptr, int tok_div = 0,
+                          const unsigned long long* __restrict__ d_blob = nullptr) {
     const int warps_per_block = (int) (blockDim.x >> 5);
     const long long slot = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
     const long long rows_per_hit = 2LL * FF;
@@ -133,7 +134,10 @@ __global__ void gu_kernel(const uint8_t* __restrict__ blob_base, const int32_t* 
     const int i = (int) (slot % rows_per_hit);
     const int lane = threadIdx.x & 31;
 
-    const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
+    // igpu-rework: d_blob (alias cache) holds each slot's host pointer into the GTT-mapped expert file;
+    // the copy path derives the blob from the arena base and a uniform slot stride.
+    const uint8_t* blob = d_blob ? (const uint8_t*) (uintptr_t) d_blob[slot_index[h]]
+                                 : blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
     if (tok_div > 0) {   // plan v0.3 P6 verify window: each hit reads its own token's activation
         const int tok = dst_index[h] / tok_div;
         x_q8_0 += (size_t) tok * (size_t) (H / 32) * 34;
@@ -178,7 +182,8 @@ __global__ void swiglu_kernel(float* __restrict__ gate_up, long long n_pairs) {
 __global__ void down_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
                             const int32_t* __restrict__ dst_index, long long blob_bytes,
                             const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales,
-                            float* __restrict__ out, int n_hits, const int32_t* __restrict__ d_count = nullptr) {
+                            float* __restrict__ out, int n_hits, const int32_t* __restrict__ d_count = nullptr,
+                            const unsigned long long* __restrict__ d_blob = nullptr) {
     const int warps_per_block = (int) (blockDim.x >> 5);
     const long long row = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
     const long long total = (long long) n_hits * H;
@@ -188,7 +193,8 @@ __global__ void down_kernel(const uint8_t* __restrict__ blob_base, const int32_t
     const int r = (int) (row % H);
     const int lane = threadIdx.x & 31;
 
-    const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
+    const uint8_t* blob = d_blob ? (const uint8_t*) (uintptr_t) d_blob[slot_index[h]]
+                                 : blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
     const uint8_t* xb = h_q8_0 + (size_t) h * (size_t) (FF / 32) * 34;
     const float acc = row_dot_s2_q8(blob + O_D_CODES + (size_t) r * ROW_D,
                                     blob + O_D_SCALES + (size_t) r * SC_D * 2, xb, FF / 32, lane,
@@ -285,7 +291,7 @@ __global__ void gu_pair_kernel(const uint8_t* __restrict__ blob_base, const int3
                                long long blob_bytes, const uint8_t* __restrict__ x_q8_0,
                                const float* __restrict__ x_scales, float* __restrict__ gate_up, int n_hits,
                                const int32_t* __restrict__ d_count, const int32_t* __restrict__ dst_index,
-                               int tok_div) {
+                               int tok_div, const unsigned long long* __restrict__ d_blob = nullptr) {
     const int warps_per_block = (int) (blockDim.x >> 5);
     const long long pair = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
     const long long total = (long long) n_hits * FF;
@@ -295,7 +301,8 @@ __global__ void gu_pair_kernel(const uint8_t* __restrict__ blob_base, const int3
     const int r = (int) (pair % FF);
     const int lane = threadIdx.x & 31;
 
-    const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
+    const uint8_t* blob = d_blob ? (const uint8_t*) (uintptr_t) d_blob[slot_index[h]]
+                                 : blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
     if (tok_div > 0) {
         const int tok = dst_index[h] / tok_div;
         x_q8_0 += (size_t) tok * (size_t) (H / 32) * 34;
@@ -327,7 +334,8 @@ __global__ void gu_pair_kernel(const uint8_t* __restrict__ blob_base, const int3
 __global__ void down_pair_kernel(const uint8_t* __restrict__ blob_base, const int32_t* __restrict__ slot_index,
                                  const int32_t* __restrict__ dst_index, long long blob_bytes,
                                  const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales,
-                                 float* __restrict__ out, int n_hits, const int32_t* __restrict__ d_count) {
+                                 float* __restrict__ out, int n_hits, const int32_t* __restrict__ d_count,
+                                 const unsigned long long* __restrict__ d_blob = nullptr) {
     const int warps_per_block = (int) (blockDim.x >> 5);
     const long long pair = (long long) blockIdx.x * warps_per_block + (threadIdx.x >> 5);
     const long long total = (long long) n_hits * (H / 2);
@@ -337,7 +345,8 @@ __global__ void down_pair_kernel(const uint8_t* __restrict__ blob_base, const in
     const int r = 2 * (int) (pair % (H / 2));
     const int lane = threadIdx.x & 31;
 
-    const uint8_t* blob = blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
+    const uint8_t* blob = d_blob ? (const uint8_t*) (uintptr_t) d_blob[slot_index[h]]
+                                 : blob_base + (size_t) slot_index[h] * (size_t) blob_bytes;
     const uint8_t* xrow = h_q8_0 + (size_t) h * (size_t) (FF / 32) * 34;
     const float* xs = h_scales ? h_scales + (size_t) h * (size_t) (FF / 32) : nullptr;
     const uint8_t* codes = blob + O_D_CODES + (size_t) r * ROW_D;
@@ -412,14 +421,16 @@ template <bool DOWN>
 __global__ void cpu_order_projection_kernel(const uint8_t* blob_base, const int32_t* slots,
                                               const int32_t* destinations, long long blob_bytes,
                                               const uint8_t* xq, const float* xs, const float* hx,
-                                              float* out, int n_hits) {
+                                              float* out, int n_hits,
+                                              const unsigned long long* __restrict__ d_blob = nullptr) {
     constexpr int rows_per_hit = DOWN ? H : 2 * FF;
     const int row = blockIdx.x * (blockDim.x / 8) + threadIdx.x / 8;
     if (row >= n_hits * rows_per_hit) return;
     const int h = row / rows_per_hit;
     const int r = row % rows_per_hit;
     const int lane = threadIdx.x & 7;
-    const uint8_t* blob = blob_base + (size_t) slots[h] * (size_t) blob_bytes;
+    const uint8_t* blob = d_blob ? (const uint8_t*) (uintptr_t) d_blob[slots[h]]
+                                 : blob_base + (size_t) slots[h] * (size_t) blob_bytes;
     const int chunks_offset = DOWN ? h * (FF / 32) : 0;
     const uint8_t* codes = DOWN ? blob + O_D_CODES + (size_t) r * ROW_D : blob + (size_t) r * ROW_GU;
     const uint8_t* scales = DOWN ? blob + O_D_SCALES + (size_t) r * SC_D * 2
@@ -531,31 +542,34 @@ bool new_hit(const void* blob_base, long long blob_bytes, const void* x_q8_0, co
 // The per-hit path's two projections, previous or new kernels (one warp per row, or per pair of rows).
 void launch_hit_gu(bool fast, const uint8_t* blob_base, const int32_t* slot_index, long long blob_bytes,
                    const uint8_t* x_q8_0, const float* x_scales, float* gate_up, long long cap,
-                   const int32_t* d_count, const int32_t* dst_index, int tok_div, cudaStream_t cs) {
+                   const int32_t* d_count, const int32_t* dst_index, int tok_div, cudaStream_t cs,
+                   const unsigned long long* d_blob = nullptr) {
     const int warps = THREADS / 32;
     if (fast) {
         const long long pairs = cap * (long long) FF;
         gu_pair_kernel<<<(unsigned) ((pairs + warps - 1) / warps), THREADS, 0, cs>>>(
-            blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) cap, d_count, dst_index, tok_div);
+            blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) cap, d_count, dst_index, tok_div,
+            d_blob);
     } else {
         const long long rows = cap * 2LL * FF;
         gu_kernel<<<(unsigned) ((rows + warps - 1) / warps), THREADS, 0, cs>>>(
-            blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) cap, d_count, dst_index, tok_div);
+            blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) cap, d_count, dst_index, tok_div,
+            d_blob);
     }
 }
 
 void launch_hit_down(bool fast, const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
                      long long blob_bytes, const uint8_t* h_q8_0, const float* h_scales, float* out, long long cap,
-                     const int32_t* d_count, cudaStream_t cs) {
+                     const int32_t* d_count, cudaStream_t cs, const unsigned long long* d_blob = nullptr) {
     const int warps = THREADS / 32;
     if (fast) {
         const long long pairs = cap * (long long) (H / 2);
         down_pair_kernel<<<(unsigned) ((pairs + warps - 1) / warps), THREADS, 0, cs>>>(
-            blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out, (int) cap, d_count);
+            blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out, (int) cap, d_count, d_blob);
     } else {
         const long long rows = cap * (long long) H;
         down_kernel<<<(unsigned) ((rows + warps - 1) / warps), THREADS, 0, cs>>>(
-            blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out, (int) cap, d_count);
+            blob_base, slot_index, dst_index, blob_bytes, h_q8_0, h_scales, out, (int) cap, d_count, d_blob);
     }
 }
 
@@ -578,7 +592,7 @@ uint64_t moe_hit_grouped_scratch_bytes(int64_t n_hits, int64_t n_embd, int64_t n
 
 void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
                         int64_t n_hits, int64_t blob_bytes, const uint8_t* x_q8_0, void* scratch, float* out,
-                        void* stream, const float* x_scales) {
+                        void* stream, const float* x_scales, const uint64_t* d_blob) {
     if (n_hits <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
     const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, n_hits);
@@ -592,7 +606,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
     // 1. gate + up, one launch for every row of every hit.
     {
         launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, n_hits, nullptr, nullptr,
-                      0, cs);
+                      0, cs, (const unsigned long long*) d_blob);
         check("moe_hit_grouped_s2/gu", stream);
     }
     // 2. silu(gate) * up.
@@ -612,7 +626,8 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
     // 4. down.
     {
         launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
-                        x_scales != nullptr ? h_scales : nullptr, out, n_hits, nullptr, cs);
+                        x_scales != nullptr ? h_scales : nullptr, out, n_hits, nullptr, cs,
+                        (const unsigned long long*) d_blob);
         check("moe_hit_grouped_s2/down", stream);
     }
 }
@@ -682,7 +697,8 @@ void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_exp
 
 void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
                             const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
-                            void* scratch, float* out, void* stream, const float* x_scales) {
+                            void* scratch, float* out, void* stream, const float* x_scales,
+                            const uint64_t* d_blob) {
     if (cap <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
     const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);
@@ -693,7 +709,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
     float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
     {
         launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, nullptr, 0,
-                      cs);
+                      cs, (const unsigned long long*) d_blob);
         check("moe_hit_grouped_s2_dev/gu", stream);
     }
     {
@@ -705,7 +721,8 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
     else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
     {
         launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
-                        x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
+                        x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs,
+                        (const unsigned long long*) d_blob);
         check("moe_hit_grouped_s2_dev/down", stream);
     }
 }
@@ -719,7 +736,8 @@ void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int
 
 void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
                               const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
-                              const float* x_scales, int k_per_token, void* scratch, float* out, void* stream) {
+                              const float* x_scales, int k_per_token, void* scratch, float* out, void* stream,
+                              const uint64_t* d_blob) {
     if (cap <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
     const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);
@@ -730,7 +748,7 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
     float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
     {
         launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, dst_index,
-                      k_per_token, cs);
+                      k_per_token, cs, (const unsigned long long*) d_blob);
         check("moe_hit_grouped_s2_multi/gu", stream);
     }
     {
@@ -742,7 +760,8 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
     else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
     {
         launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
-                        x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
+                        x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs,
+                        (const unsigned long long*) d_blob);
         check("moe_hit_grouped_s2_multi/down", stream);
     }
 }
@@ -1146,7 +1165,7 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
 void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_index,
                                  const int32_t* dst_index, int64_t n_hits, int64_t blob_bytes,
                                  const uint8_t* x_q8_0, void* scratch, float* out, void* stream,
-                                 const float* x_scales, float* gate_up_trace) {
+                                 const float* x_scales, float* gate_up_trace, const uint64_t* d_blob) {
     if (n_hits <= 0) return;
     if (x_scales == nullptr) {
         std::fprintf(stderr, "moe_hit_grouped_s2_cpu_order requires fp32 activation scales\n");
@@ -1167,7 +1186,8 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_
     const int rows_per_block = THREADS / 8;
     cpu_order_projection_kernel<false><<<(unsigned) ((n_hits * 2 * FF + rows_per_block - 1) / rows_per_block),
                                             THREADS, 0, cs>>>(
-        blob_base, slot_index, dst_index, blob_bytes, x_q8_0, x_scales, xh, gu, (int) n_hits);
+        blob_base, slot_index, dst_index, blob_bytes, x_q8_0, x_scales, xh, gu, (int) n_hits,
+        (const unsigned long long*) d_blob);
     check("cpu_order/gate_up", stream);
     if (gate_up_trace != nullptr &&
         cudaMemcpyAsync(gate_up_trace, gu, (size_t) n_hits * 2 * FF * sizeof(float),
@@ -1183,7 +1203,8 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_
     check("cpu_order/intermediate_quantize", stream);
     cpu_order_projection_kernel<true><<<(unsigned) ((n_hits * H + rows_per_block - 1) / rows_per_block),
                                            THREADS, 0, cs>>>(
-        blob_base, slot_index, dst_index, blob_bytes, hq, hs, hh, out, (int) n_hits);
+        blob_base, slot_index, dst_index, blob_bytes, hq, hs, hh, out, (int) n_hits,
+        (const unsigned long long*) d_blob);
     check("cpu_order/down", stream);
 }
 

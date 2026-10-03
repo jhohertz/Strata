@@ -2779,11 +2779,66 @@ int main(int argc, char** argv) {
         int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
         int failed = 0;
         int zero_reads = 0;
+        // igpu-rework (docs/IGPU.md): on an integrated GPU the expert "arena" is a copy of data the kernel can
+        // already read (P0: host-buffer reads at the exact device-buffer rate, 82.6 GB/s; the 0.1.36 prefill
+        // spent 20.6 s of its 33 s in exactly this copy path, and the CPU pool the misses feed is what sets the
+        // floor).  Alias instead: one 64-bit host pointer per (layer, expert) in a 196 KiB device table, every
+        // expert resident, the pool sees no misses.  Needs stable, non-transient blobs - the --mmap-experts file
+        // mapping.  STRATA_IGPU_ALIAS=1 forces it, =0 forces the copy path; the default is automatic on an
+        // integrated device (cudaDevAttrIntegrated).
+        bool alias_opened = false;
+        {
+            const char* env = std::getenv("STRATA_IGPU_ALIAS");
+            int integrated = 0;
+            (void) cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0);
+            const bool want_alias = env != nullptr ? env[0] == '1' : integrated == 1;
+            if (want_alias) {
+                bool okp = srcp != nullptr;
+                for (int64_t l = 0; okp && l < g.n_layers; ++l)
+                    for (int64_t e = 0; okp && e < g.n_expert; ++e) okp = !srcp->transient(l, e);
+                if (okp && !xcache.open_aliased(g.n_layers, g.n_expert, err)) {
+                    std::fprintf(stderr, "strata generate: igpu alias cache: %s\n", err.c_str());
+                    return 1;
+                }
+                if (okp) {
+                    std::vector<uint64_t> ptrs((size_t) g.n_layers * (size_t) g.n_expert, 0);
+                    bool all = true;
+                    for (int64_t l = 0; all && l < g.n_layers; ++l)
+                        for (int64_t e = 0; all && e < g.n_expert; ++e) {
+                            const uint8_t* b = srcp->blob(l, e);
+                            if (b == nullptr) { all = false; break; }
+                            (void) xcache.admit(l, e);
+                            ptrs[(size_t) l * (size_t) g.n_expert + (size_t) e] = (uint64_t) (uintptr_t) b;
+                        }
+                    if (all && !xcache.set_aliased_pointers(ptrs.data(), err)) all = false;
+                    if (all) {
+                        alias_opened = true;
+                        std::fprintf(stderr,
+                                     "strata generate: IGPU ALIAS cache: %lld experts, one 64-bit host pointer each "
+                                     "(%.0f KiB of device memory, 0 GiB of blob copies);\n"
+                                     "                 every expert is resident, so the GPU computes every expert row "
+                                     "and the CPU pool sees no misses (docs/IGPU.md)\n",
+                                     (long long) xcache.slots(), (double) xcache.bytes() / 1024.0);
+                    } else {
+                        xcache.close();
+                        okp = false;
+                    }
+                }
+                if (!okp) {
+                    std::fprintf(stderr,
+                                 "strata generate: igpu alias cache unavailable (it needs stable, non-transient expert "
+                                 "blobs - the --mmap-experts file mapping); STRATA_IGPU_ALIAS=1 forces it, =0 silences "
+                                 "this; the copy path continues\n");
+                }
+            }
+        }
         for (int attempt = 0;; ++attempt) {
             bool ok = false;
             if (fake_fails > 0) {
                 --fake_fails;
                 err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
+            } else if (alias_opened) {   // the alias table opened above is the whole cache
+                ok = true;
             } else {
                 ok = sized_slots.empty()
                     ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
@@ -2815,7 +2870,7 @@ int main(int argc, char** argv) {
 #endif
                 return 1;
             }
-            if (!auto_cache || attempt - failed >= 6) break;
+            if (!auto_cache || attempt - failed >= 6 || alias_opened) break;
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
@@ -2839,8 +2894,14 @@ int main(int argc, char** argv) {
                          o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
     }
     if (o.expert_cache > 0) {
-        std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
-                     (long long) xcache.slots(), xcache.gib());
+        if (xcache.aliases()) {
+            std::fprintf(stderr, "strata generate: expert cache %lld slots (aliasing host pointers: %.0f KiB of device "
+                                 "memory, 0 GiB of blob copies); every expert resident\n",
+                         (long long) xcache.slots(), (double) xcache.bytes() / 1024.0);
+        } else {
+            std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
+                         (long long) xcache.slots(), xcache.gib());
+        }
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -2853,7 +2914,9 @@ int main(int argc, char** argv) {
                      "strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
                      "                 so a reply can differ slightly from a run without the cache (same quality:\n"
                      "                 bench/results/2026-09-27-cache-parity).\n");
-        if (o.expert_cache_per_layer) {
+        if (xcache.aliases()) {
+            // the alias cache is fully resident by construction: there is no admission policy to print
+        } else if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);
             std::fprintf(stderr, "                 R4.2g PER-LAYER: each layer owns %lld slots (%lld..%lld).\n",
@@ -2863,13 +2926,16 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr, "                 PROFILE, ranked by routing frequency, no eviction.\n");
         }
+    } else if (xcache.aliases()) {
+        std::fprintf(stderr, "strata generate: expert cache (alias) %lld slots: every expert resident, no policy\n",
+                     (long long) xcache.slots());
     }
     // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
     int64_t prefilled = 0;
-    if (!profile.empty() && srcp != nullptr) {
+    if (!profile.empty() && srcp != nullptr && !xcache.aliases()) {   // the alias table is filled above, once
         // #369 (dag08): per layer, a full layer skips only its own pairs - each layer takes its hottest experts until
         // its range is full (one full layer used to end the whole fill, leaving most layers empty)
         const bool per_layer = xcache.per_layer_admission();
@@ -3097,9 +3163,12 @@ int main(int argc, char** argv) {
         }
         drive.d.cache = &xcache;
         drive.d.cache_stream = main_cs;
-        drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
-        drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        // igpu-rework: an alias cache has no arena.  cache_base stays null so every "base + offset" resolution
+        // (the host plan, the device plan, the verify graph) reduces to the per-slot host pointer itself.
+        drive.d.cache_base = xcache.aliases() ? nullptr : (const uint8_t*) xcache.device_slot(0);
+        drive.d.cache_blob = xcache.aliases() ? 0 : (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         drive.d.cache_slot_off = xcache.slot_offsets();
+        drive.d.cache_blob_ptrs = xcache.device_pointer_table();
         drive.d.hit_scratch = hit_scratch;
         drive.d.parts_out = d_parts;
         drive.d.hit_out = d_hit_out;
@@ -3667,6 +3736,7 @@ int main(int argc, char** argv) {
         }
         thits.cache_base = drive.d.cache_base;
         thits.blob = drive.d.cache_blob;
+        thits.d_blob = xcache.device_pointer_table();
         thits.d_slot = drive.d.d_slot;
         thits.d_dst = drive.d.d_dst;
         thits.d_count = d_hit_count;
@@ -5787,7 +5857,9 @@ int main(int argc, char** argv) {
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
-        if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
+        if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr && !xcache.aliases()) {
+            // igpu-rework: an alias cache has no arena to lend; the prompt path takes its own buffers instead
+            // ("no cache slots to borrow")
             int64_t chunk = o.prefill_chunk;
             int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
             const int64_t request_sized = request_chunk(n_batched, chunk);

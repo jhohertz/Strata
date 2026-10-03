@@ -230,3 +230,56 @@ target is now quantified**. Next: P1 implementation on this branch
 (ExpertCache alias mode + full pointer table + the two resolution-kernel
 variants + `cudaDevAttrIntegrated` detection + `STRATA_IGPU_ALIAS` override),
 then the 3-pass smoke gate.
+
+## P1: the aliasing expert cache (first pass)
+
+Implemented on this branch (additive, gated: `cudaDevAttrIntegrated` detection +
+`STRATA_IGPU_ALIAS=0|1` override; the dGPU copy path is unchanged code):
+
+- `ExpertCache::open_aliased(layers, experts)`: one slot per (layer, expert),
+  `blob_ = 8`, the device side is a 24,576 x 8 B = 192 KiB pointer table
+  (`d_ptrs_`); `set_aliased_pointers()` uploads it with a D2H identity check.
+  `slot_offsets()` returns the host table, `device_slot()` returns the host
+  pointer, `fill_slot*()` are 8-byte pointer writes, `valid()`/`close()`
+  alias-aware.
+- Every existing "(cache_base, slot_off)" resolution point works without
+  change, because `nullptr + ptr_table[slot]` is the host pointer itself: the
+  host plan (the `GpuPlanSink` ternary), the device plan
+  (`resident_plan_kernel`), the verify CUDA graph, and the prompt path's
+  `device_slot()` lookups.
+- The five per-entry decode kernels (`gu`, `down`, `gu_pair`, `down_pair`,
+  `cpu_order_projection`) get a trailing `d_blob` parameter:
+  `d_blob ? d_blob[slot] : blob_base + slot*blob_bytes`, plumbed through the
+  four `moe_hit_grouped_s2*` wrappers, `ExpertDispatch`, and `TokenHits`.
+  Default null = the copy path, byte-identical.
+- `generate.cpp`: on an integrated device (or `STRATA_IGPU_ALIAS=1`) with
+  stable non-transient blobs (the `--mmap-experts` file mapping), admit all
+  24,576 experts, publish their file pointers, and skip the arena open, the
+  profile prefill, and the prompt-path cache borrow (the prompt path then
+  allocates its own buffers - the proven "no cache" dGPU path).
+
+**First run (2026-10-02, boot 2, after the clean P0 session): HANG.**
+`STRATA_IGPU_ALIAS=1`, arithmetic prompt (43 tokens), `timeout 600`: the
+engine logged through "session is up", "token graph hit path: 24576 resident
+experts", "prompt path allocates its own buffers", "prefill gemm: hipBLASLt
+tuning enabled" (one dense GEMM completed), then produced **no output for 10
+minutes until the timeout killed it**. No fault printed, no verify watchdog
+(20 s) fired - so the hang is outside the verify window.
+
+Desk analysis: every alias-specific kernel is a plain read (the micro proved
+GTT reads; `gather_native` already degrades to byte-copies for 8-aligned
+pointers, so alignment cannot fault); the verify window self-times-out at 20 s
+per step; nothing in the prompt path spins. The one thing that is genuinely
+new: **prompt-path kernels reading the 31.6 GiB GTT-mapped `experts.bin`
+directly** - the same memory the 0.1.36 copy-path faults (`iq_dequant_gu_f16`
+/ `prefill copy_i32`) sit in. Working theory: the APU's KFD/VM layer wedges
+on sustained kernel reads of the GTT-mapped file (the simple 500 MiB micro
+read passes; the MMQ-pattern access of 24,576 blobs does not).
+
+After the timeout kill the APU must be rebooted (GPU work may have been
+in flight). Next: `tools/hip/p1_alias_run.sh` - the same run with
+`STRATA_TRACE=1` plus hang forensics (gpu_busy_percent, per-thread wchan,
+gdb backtraces of every thread) captured automatically ~45 s into the
+silence, then a kill. The backtraces separate "CPU parked in
+cudaStreamSynchronize" (a GPU-side wedge) from "CPU parked in a condition
+variable" (a host-thread deadlock in the pool/stager/PLE machinery).
