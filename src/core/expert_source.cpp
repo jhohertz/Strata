@@ -461,6 +461,8 @@ void FileExpertSource::close() {
         if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
         else {
             if (complement_partial_) (void) cudaHostUnregister(complement_arena_);
+            if (gpu_register_bytes_ > 0)
+                (void) cudaHostUnregister((uint8_t*) complement_arena_ + gpu_register_off_);
             if (complement_locked_ > 0)
                 strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
             std::free(complement_arena_);
@@ -490,6 +492,8 @@ void FileExpertSource::close() {
     complement_ready_ = false;
     complement_locked_ = 0;
     complement_lent_slots_ = 0;
+    gpu_register_off_ = 0;
+    gpu_register_bytes_ = 0;
     if (!maps_.empty()) {
         for (Map& m : maps_) {
 #if defined(_WIN32)
@@ -1426,6 +1430,41 @@ int64_t FileExpertSource::commit_exchanges() {
     staged_.clear();
     exchanges_ += n;
     return n;
+}
+
+bool FileExpertSource::register_complement_for_gpu(std::string& err) {
+    err.clear();
+    if (!complement_ready_ || complement_host_ == nullptr) return true;   // no complement: nothing to do
+    if (gpu_register_bytes_ > 0) return true;
+    // A full pin registered the whole arena; a partial pin registered its first pin_limit_ bytes.
+    const uint64_t registered = complement_pinned_ ? complement_bytes_ : complement_pin_limit_;
+    if (registered >= complement_bytes_) return true;
+    uint8_t* at = (uint8_t*) complement_host_ + registered;
+    const uint64_t n = complement_bytes_ - registered;
+    if (cudaHostRegister(at, (size_t) n, cudaHostRegisterDefault) == cudaSuccess) {
+        gpu_register_off_ = registered;
+        gpu_register_bytes_ = n;
+        return true;
+    }
+    const std::string refused = cudaGetErrorString(cudaGetLastError());
+    // Fallback: a full H2D pass registers by touching (measured 36.3 GB/s, 32 GiB in 946 ms on the 780M).
+    uint8_t* d = nullptr;
+    const size_t chunk = 1ull << 30;
+    if (cudaMalloc((void**) &d, chunk) != cudaSuccess) {
+        err = "the driver refused to register the " + std::to_string(n / (1ull << 30)) +
+              " GiB complement suffix (" + refused + ") and the fallback DMA buffer could not be allocated";
+        return false;
+    }
+    for (uint64_t off = 0; off < complement_bytes_; off += chunk) {
+        const size_t b = (size_t) std::min<uint64_t>(chunk, complement_bytes_ - off);
+        if (cudaMemcpy(d, complement_host_ + off, b, cudaMemcpyHostToDevice) != cudaSuccess) {
+            (void) cudaFree(d);
+            err = "the driver refused to register the complement (" + refused + ") and the fallback DMA pass failed";
+            return false;
+        }
+    }
+    (void) cudaFree(d);
+    return true;   // DMA-touched: kernel-readable, nothing to unregister
 }
 
 const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {

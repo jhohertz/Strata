@@ -2820,14 +2820,22 @@ int main(int argc, char** argv) {
                         okp = false;
                     } else {
                         const uint64_t alias_headroom = std::min<uint64_t>(o.resident_headroom, 2ull << 30);
-                        if (!file_src->pin_cache_complement(xcache, err, o.resident_pin, {}, -1, alias_headroom,
-                                                             o.resident_budget, nullptr)) {
+                        if (file_src->pin_cache_complement(xcache, err, o.resident_pin, {}, -1, alias_headroom,
+                                                           o.resident_budget, nullptr) &&
+                            // the kernels then read this RAM directly; unregistered host memory faults on this
+                            // iGPU (docs/IGPU.md) - register it (no copy) or fall back to the H2D touch
+                            !file_src->register_complement_for_gpu(err)) {
                             std::fprintf(stderr,
                                          "strata generate: igpu alias cache: the full RAM complement could not be "
-                                         "built (%s); the copy path continues\n",
+                                         "built and made kernel-readable (%s); the copy path continues\n",
                                          err.c_str());
                             xcache.close();
                             okp = false;
+                        } else {
+                            std::fprintf(stderr,
+                                         "strata generate: the %.2f GiB expert complement is registered for direct "
+                                         "kernel reads (no H2D copies)\n",
+                                         (double) file_src->resident_bytes() / 1073741824.0);
                         }
                     }
                 }

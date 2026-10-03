@@ -151,7 +151,7 @@ int run_fixed_arm(unsigned long long va, long long gib) {
                                  -1, 0);
     if (p == MAP_FAILED) { std::perror("igpu_gtt_micro: mmap fixed"); return 2; }
     if ((uintptr_t) p != va) { std::fprintf(stderr, "igpu_gtt_micro: fixed VA moved to %p\n", (void*) p); return 2; }
-    for (long long i = 0; i < bytes; i += 4096) p[i] = 0x5a;   // touch: real pages
+    std::memset(p, 0x5a, bytes);   // touch: real pages (every byte; the sparse 1-byte/page touch faults on this APU)
     std::printf("igpu_gtt_micro: fixed %lld GiB at %012llx\n", gib, va);
     const int kBlocks = 512;
     uint32_t* d_partials = nullptr;
@@ -183,7 +183,7 @@ int run_chunks_arm(int n, long long gib) {
         uint8_t* at = (uint8_t*) mmap(reserve + (long long) c * (chunk + gap), (size_t) chunk, PROT_READ | PROT_WRITE,
                                       MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (at == MAP_FAILED) { std::perror("igpu_gtt_micro: commit chunk"); return 2; }
-        for (long long i = 0; i < chunk; i += 4096) at[i] = 0x5a;   // touch: real pages
+        std::memset(at, 0x5a, chunk);   // touch: real pages (every byte)
     }
     std::printf("igpu_gtt_micro: %d chunks x %lld GiB (+64 KiB gaps) in a %.2f GiB reservation at %p\n", n, gib,
                 (double) total_va / 1073741824.0, (void*) reserve);
@@ -219,11 +219,25 @@ int run_anon_arm(long long gib) {
     const long long bytes = gib * (1ll << 30);
     uint8_t* host = (uint8_t*) std::malloc(bytes);
     if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib); return 2; }
-    for (long long i = 0; i < bytes; i += 4096) host[i] = 0x5a;   // touch: real pages
+    std::memset(host, 0x5a, bytes);   // touch: real pages (identical to the 1 GiB arm that passes)
     std::printf("igpu_gtt_micro: anon %lld GiB map=%p\n", gib, (void*) host);
     const int kBlocks = 512;
     uint32_t* d_partials = nullptr;
+    uint8_t* d_pre = nullptr;
     CHECK(hipMalloc(&d_partials, kBlocks * sizeof(uint32_t)));
+    // Model under test (every datum so far): the 1 GiB arm that passes does a 1 GiB H2D hipMemcpy (the GPU's
+    // DMA engine reads the host VMA) before the first kernel host read; a 64 MiB ping of the same VMA left the
+    // kernel read faulting.  Registration appears per touched RANGE, so ping the WHOLE VMA: a 2 GiB device
+    // buffer as target, walking the host buffer end to end (one DMA pass, ~1 s at the measured 35.8 GB/s).
+    const long long ping_chunk = 2ll << 30;
+    CHECK(hipMalloc(&d_pre, (size_t) ping_chunk));
+    const auto pf0 = std::chrono::steady_clock::now();
+    for (long long off = 0; off < bytes; off += ping_chunk)
+        CHECK(hipMemcpy(d_pre, host + off, (size_t) std::min(ping_chunk, bytes - off), hipMemcpyHostToDevice));
+    const long long ping_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - pf0).count();
+    std::printf("A-anon   H2D ping of the whole VMA: %7.1f GB/s  (%lld ms)\n",
+                (double) bytes / 1e9 / (ping_ms / 1000.0), (long long) ping_ms);
     CHECK(hipMemsetAsync(d_partials, 0, kBlocks * sizeof(uint32_t), 0));
     const auto t0 = std::chrono::steady_clock::now();
     xor_read_kernel<<<kBlocks, 256, 0, (hipStream_t) 0>>>((const float4*) host, bytes / 16, d_partials);
@@ -234,6 +248,65 @@ int run_anon_arm(long long gib) {
     std::printf("A-anon   %7.1f GB/s  (%lld ms for %lld GiB)\n", (double) bytes / 1e9 / (ms / 1000.0), (long long) ms,
                 gib);
     CHECK(hipFree(d_partials));
+    CHECK(hipFree(d_pre));
+    return 0;
+}
+
+// P1 reg-after-dma arm: the engine registers its complement AFTER gigabytes of device DMA (weight
+// loads); the micro's reg arm registered before any GPU activity and passed.  Does a register placed
+// after a first DMA still work?  If this faults and --reg passes, the engine must register before its
+// first GPU traffic (or use the H2D touch instead).
+int run_reg_after_dma_arm(long long gib) {
+    const long long bytes = gib * (1ll << 30);
+    uint8_t* host = (uint8_t*) std::malloc(bytes);
+    if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib); return 2; }
+    std::memset(host, 0x5a, bytes);
+    uint8_t* d_scratch = nullptr;
+    uint8_t* h_scratch = (uint8_t*) std::malloc(1ull << 20);
+    CHECK(hipMalloc(&d_scratch, 1ull << 20));
+    CHECK(hipMemcpy(d_scratch, h_scratch, 1ull << 20, hipMemcpyHostToDevice));   // the first DMA of the process
+    const hipError_t reg = hipHostRegister(host, (size_t) bytes, hipHostRegisterDefault);
+    std::printf("igpu_gtt_micro: reg-after-dma %lld GiB map=%p (1 MiB DMA first, then register) -> %s\n", gib, (void*) host,
+                hipGetErrorString(reg));
+    if (reg != hipSuccess) return 2;
+    uint32_t* d_partials = nullptr;
+    CHECK(hipMalloc(&d_partials, 512 * sizeof(uint32_t)));
+    CHECK(hipMemsetAsync(d_partials, 0, 512 * sizeof(uint32_t), 0));
+    xor_read_kernel<<<512, 256, 0, (hipStream_t) 0>>>((const float4*) host, bytes / 16, d_partials);
+    CHECK(hipGetLastError());
+    CHECK(hipStreamSynchronize(0));
+    std::printf("R-after  kernel read after late register: OK\n");
+    CHECK(hipFree(d_partials));
+    CHECK(hipFree(d_scratch));
+    (void) hipHostUnregister(host);
+    return 0;
+}
+
+// P1 reg arm: does hipHostRegister alone (no DMA touch) make a big anonymous VMA kernel-readable?
+// `flags` lets us A/B the exact registration the engine used (Mapped|Portable) against Default.
+int run_reg_arm(long long gib, unsigned flags, const char* label) {
+    const long long bytes = gib * (1ll << 30);
+    uint8_t* host = (uint8_t*) std::malloc(bytes);
+    if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib); return 2; }
+    std::memset(host, 0x5a, bytes);
+    const hipError_t reg = hipHostRegister(host, (size_t) bytes, flags);
+    std::printf("igpu_gtt_micro: %s %lld GiB map=%p hipHostRegister(0x%x) -> %s\n", label, gib, (void*) host, flags,
+                hipGetErrorString(reg));
+    if (reg != hipSuccess) return 2;
+    const int kBlocks = 512;
+    uint32_t* d_partials = nullptr;
+    CHECK(hipMalloc(&d_partials, kBlocks * sizeof(uint32_t)));
+    CHECK(hipMemsetAsync(d_partials, 0, kBlocks * sizeof(uint32_t), 0));
+    const auto t0 = std::chrono::steady_clock::now();
+    xor_read_kernel<<<kBlocks, 256, 0, (hipStream_t) 0>>>((const float4*) host, bytes / 16, d_partials);
+    CHECK(hipGetLastError());
+    CHECK(hipStreamSynchronize(0));
+    const long long ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("R-reg    %7.1f GB/s  (%lld ms for %lld GiB, NO h2d ping)\n", (double) bytes / 1e9 / (ms / 1000.0),
+                (long long) ms, gib);
+    CHECK(hipFree(d_partials));
+    (void) hipHostUnregister(host);
     return 0;
 }
 
@@ -305,7 +378,14 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--fixed") == 0 && i + 2 < argc)
             return run_fixed_arm((unsigned long long) strtoull(argv[i + 1], nullptr, 16), (long long) std::atof(argv[i + 2]));
         if (std::strcmp(argv[i], "--chunks") == 0 && i + 3 < argc)
-            return run_chunks_arm(std::atoi(argv[i + 2]), (long long) std::atof(argv[i + 3]));
+            return run_chunks_arm(std::atoi(argv[i + 1]), (long long) std::atof(argv[i + 2]));
+        if (std::strcmp(argv[i], "--reg") == 0 && i + 1 < argc)
+            return run_reg_arm((long long) std::atof(argv[i + 1]), hipHostRegisterDefault, "reg-default");
+        if (std::strcmp(argv[i], "--reg-mapped") == 0 && i + 1 < argc)
+            return run_reg_arm((long long) std::atof(argv[i + 1]),
+                               (unsigned) (hipHostRegisterMapped | hipHostRegisterPortable), "reg-mapped");
+        if (std::strcmp(argv[i], "--reg-after-dma") == 0 && i + 1 < argc)
+            return run_reg_after_dma_arm((long long) std::atof(argv[i + 1]));
     }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;
     constexpr long long bytes = 1ll << 30;   // 1 GiB

@@ -461,3 +461,41 @@ Boot 9 protocol (one boot, ascending, stop at the first fault):
        complement must then be split into separate allocations (no
        shared reservation) - the pointer table already stores absolute
        pointers, so only the arena plumbing changes.
+
+**Runs 9-13 (2026-10-03 00:4x-01:0x, boot of 00:42): the KFD model is
+found, and the engine's hang gets a second data point.**
+
+The "per-VMA size cap" was an artifact of the test shape.  The micro's
+arms, in order:
+- `--anon 1` with a 64 MiB H2D ping first: FAULT.
+- `--anon 1` with a FULL 1 GiB H2D ping first: PASS (ping 17 GB/s, read
+  82.6 GB/s).
+- `--anon 32` with a full 32 GiB H2D ping first: PASS (ping 36.3 GB/s in
+  946 ms, read 74.1 GB/s).
+- `--reg 8` / `--reg 32`: hipHostRegister alone (no DMA at all) makes the
+  whole region kernel-readable: PASS at 54.4 / 54.8 GB/s.
+
+**The model (measured, gfx1103 + ROCm 10.0.0~pre4):** a host VMA is
+kernel-readable only after the driver has been told about it -
+hipHostRegister, or a DMA pass over the range (registration is per
+touched range; a partial ping left the rest faulting).  Size is not a
+limit (32 GiB passes); file-vs-anonymous is not a limit either (the file
+slices faulted for lack of registration, not because they were files).
+
+**The engine, with the complement registered at alias open, still hung**
+(same shape: clean startup, "the 31.64 GiB expert complement is
+registered", then 10 min of silence until the timeout).  Two variables
+separate the passing micro from the engine:
+1. **flags**: the micro used `hipHostRegisterDefault`; the engine's first
+   attempt used `Mapped|Portable`.  (The engine is now switched to
+   Default; the micro gained `--reg-mapped` to A/B the flags.)
+2. **ordering**: the micro registered before any GPU traffic; the engine
+   registers after ~1.5 GiB of weight loads (gigabytes of prior DMA).
+   (The micro gained `--reg-after-dma`: a 1 MiB DMA first, then register.)
+
+The engine now registers with `hipHostRegisterDefault` and falls back to
+a full H2D touch pass if the driver refuses (`FileExpertSource::
+register_complement_for_gpu`).  `tools/hip/p1_boot_run.sh` runs the boot
+protocol: gate, `--reg-mapped 8`, `--reg-after-dma 8`, then the engine
+alias arithmetic (and, on a pass, python on the same boot - clean runs do
+not degrade the APU, so a green boot is a whole-smoke opportunity).

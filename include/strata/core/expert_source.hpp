@@ -438,6 +438,12 @@ public:
     uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
     uint64_t resident_bytes() const { return complement_bytes_; }
     bool complement_pinned() const { return complement_pinned_; }
+    /// igpu-rework (docs/IGPU.md): the iGPU's KFD/GTT path faults a kernel read of any host VMA the driver
+    /// has never seen - measured: unregistered regions fault at every size and for file mappings alike,
+    /// while hipHostRegister (no copy) or a DMA touch makes them readable at device rates.  Make the whole
+    /// complement kernel-readable: register the unregistered suffix (a full pin already covers it); if the
+    /// driver refuses, fall back to a full H2D pass, which registers by touching.
+    bool register_complement_for_gpu(std::string& err);
     bool complement_ready() const { return complement_ready_; }
     uint64_t locked_bytes() const { return complement_locked_; }
     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
@@ -558,6 +564,8 @@ private:
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
+    uint64_t gpu_register_off_ = 0;           ///< register_complement_for_gpu: the registered suffix starts here
+    uint64_t gpu_register_bytes_ = 0;
     int64_t complement_lent_slots_ = 0;
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
