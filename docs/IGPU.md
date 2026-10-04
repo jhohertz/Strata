@@ -946,13 +946,58 @@ solution launch).  Arithmetic ran clean at normal speed after the fault,
 which is a data point on the flake's aftermath, not a license to keep going:
 reboot per protocol before the A/B's longfill.
 
-## P2.2 (queued, boot after the 03:44 flake): the mmvq A/B, clean boot
+## P2.2: the mmvq A/B, clean boot (2026-10-04, boot after the 03:44 flake)
 
-`p2_boot_run2.sh` again: gate, longfill alias + `STRATA_OLD_IQ_MMVQ=1`, then
-arithmetic.  If the warmup faults again, run both A/B variants with
-`STRATA_HIPBLASLT_WARMUP=0` (fair, and it removes the fault-prone warmup from
-the path) and record that.  Either way the A/B answers: is the -46 % prefill
-regression (and possibly the flake) in the new `iq_mmVQ` kernel?
+`p2_boot_run2.sh` on a fresh boot: gate, longfill + arithmetic, both with
+`STRATA_OLD_IQ_MMVQ=1`, both **PASS** (724913, 396).  The warmup flake did not
+reproduce.  Numbers vs the P2.1 baseline (new mmvq):
+
+| case | new mmvq | old mmvq | delta |
+|---|---|---|---|
+| longfill prefill | 30551.6 ms (38.0) | 29735.7 ms (39.1) | -2.7 % |
+| arithmetic prefill | 3594.6 ms (12.2) | 3551.4 ms (12.4) | -1.2 % |
+
+**`iq_mmVQ` is not the prefill regression** (the deltas are boot-to-boot
+noise, and in the improving direction).
+
+## P2.3: the 0.1.29 baseline, rebuilt and profiled - the -46 % regression is a measurement artifact
+
+The remaining suspect for the -46 % was "somewhere in the 35 % of non-expert
+phases".  To settle it, the 0.1.29-era branch (commit `41da073`, the one that
+measured 68.8) was rebuilt in a worktree (`/home/jhohertz/co/Strata-029`,
+pack and profile symlinked, `STRATA_PREFILL_TIMING=1` available there too)
+and run with the exact 0.1.29-era smoke flags (`p2_boot_run3.sh`):
+
+| config (same boot, same flags) | longfill prefill | staging |
+|---|---|---|
+| 0.1.29 copy, first run (file partly cold) | 33527.5 ms (**34.7**) | 22249 ms |
+| 0.1.29 copy, warm re-run | 30904.5 ms (**37.6**) | 20001 ms |
+| 0.1.36 copy (Sept-Oct characterization) | 37.1/37.7 | - |
+| 0.1.36 alias (P1/P2.2) | **38.9/39.1** | 0 |
+| 0.1.29 copy (Sept 30, "warm batched") | **68.8** | (not recorded) |
+
+**On this boot, 0.1.36 alias is the fastest configuration in every case.**
+The "-46 % regression" was an artifact of comparing against the 68.8, which
+is not reproducible in any state on this boot (34.7-37.6 no matter how warm
+the file gets).  The 68.8 was almost certainly a different machine state in
+September (fully-warmed 31.64 GiB file with the CPU pool running at 5+ GB/s
+instead of the 1.8 GB/s seen here - 40.7 GiB streamed per prompt through the
+pool is what the copy path pays every time; the alias path pays it once at
+init, hidden in the complement build), or a steady-state rate reading.  The
+phase profiles say the same thing: 0.1.29's gemm phases are *slower* than
+0.1.36's (gate/up 13505 vs 12050 ms, down 5281 vs 3938 ms) - the code did not
+regress the expert gemm; the copy path's 20-22 s of per-prompt pool staging
+did the rest.  One real (small) delta: qsa doubled (1580 -> 3213 ms, 5 % ->
+10 % of the prompt) between 0.1.29 and 0.1.36 - noted, not worth a boot.
+
+**P2 restated, with same-boot numbers:** the alias prefill is 30.5 s of
+pure GPU time (wall == timeline), split gemm gate/up 39 %, the gather phase
+26 %, gemm down 13 %, qsa 10 %, gdn 8 %.  The expert section is 78 % of the
+prompt.  The next lever is the gather phase: a micro arm that times
+`gather_native` itself (GTT read + VRAM write per expert) to split kernel
+time from host inter-launch gaps - if the kernel streams at the ~54 GB/s a
+flat copy gets, the 8.0 s is launch overhead and the fix is batching;
+if it is ~1.8 GB/s like the pool, the MMQ gather pattern is the problem.
 
 ### Reboot log (the long tail)
 
