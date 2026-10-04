@@ -337,7 +337,7 @@ struct Prefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
     bool borrowed = false;
-    cudaStream_t cs = nullptr, copy = nullptr;
+    cudaStream_t cs = nullptr, copy = nullptr, cs_own = nullptr;   // cs_own: the alias-blocking test (run 27)
     Gemm gemm;
     std::vector<void*> owned;
     // chunk buffers
@@ -470,6 +470,10 @@ void Prefill::release() {
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
+    if (impl_->cs_own) {
+        if (impl_->cs == impl_->cs_own) cudaStreamSynchronize(impl_->cs_own);
+        cudaStreamDestroy(impl_->cs_own);
+    }
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     for (void* p : impl_->owned) cudaFree(p);
 }
@@ -580,6 +584,18 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
+    // igpu-rework P1 run 27: on this APU every registered-complement read on the LEGACY stream is clean
+    // (the micro, the engine's prefault DMA, the BLAS warmup), while the engine's dequant - the first
+    // complement read on a NON-BLOCKING stream - faults (a NULL-base IMA, dmesg 0x0-0x6000).  Env-gated:
+    // STRATA_IGPU_BLOCKING_CS recreates m.cs as a BLOCKING stream (default flag: it orders with the
+    // legacy stream) for alias caches, so the dequant's complement reads take the legacy queue context.
+    // The dGPU path is untouched (the env var and the alias cache are both required).
+    if (std::getenv("STRATA_IGPU_BLOCKING_CS") && cache && cache->aliases() && m.cs_own == nullptr) {
+        if (cudaStreamCreate(&m.cs_own) != cudaSuccess) { err = "prefill: the alias blocking compute stream";
+            return false;
+        }
+        m.cs = m.cs_own;
+    }
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }

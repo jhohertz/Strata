@@ -467,13 +467,14 @@ int run_file_arm(const char* path) {
     return ok1 && ok2 ? 0 : 3;
 }
 
-// igpu-rework P1 run 26: the engine's alias runs IMA in the expert section (dmesg: NULL-base reads,
-// GPU VA 0x0-0x6000).  This arm replicates layer 0's exact dequant workload - 512 experts, each
-// iq_dequant_gu_f16 + iq_dequant_f16 (Q2_0, n_ff=640, n_embd=2560, blob 1,382,400 B with gate at 0,
-// up at 460800, down at 921600 - native_expert_layout) reading a GTT-registered anonymous region the
-// way the alias cache's complement is read, after the same full DMA prefault pass.  Reproducing it
-// here means the bug is in the kernels/GTT interaction and can be bisected without an engine boot.
-int run_dequant_arm(long long gib) {
+// igpu-rework P1 run 26/27: the engine's alias runs IMA in the expert section (dmesg: NULL-base
+// reads, GPU VA 0x0-0x6000) in iq_dequant_gu_f16, while this arm's identical workload passes.
+// Run 27: every complement read so far has been on the LEGACY stream (the micro, the engine's
+// prefault DMA, the BLAS warmup) - the engine's dequant is the first kernel to read the registered
+// complement on a NON-BLOCKING stream.  Optional args: "nb" runs the dequants on a non-blocking
+// stream; a number holds that many GiB of device memory (the engine's ~8 GiB session scratch
+// pressure on the iGPU's 16 GiB budget).
+int run_dequant_arm(long long gib, bool nb, long long pressure_gib) {
     constexpr int kExperts = 512;
     constexpr int kType = 42;   // Q2_0, this pack's gu_type and d_type
     constexpr int64_t n_ff = 640, n_embd = 2560;
@@ -503,6 +504,28 @@ int run_dequant_arm(long long gib) {
     CHECK(hipMalloc(&dq_gu, 1280 * 2560 * 2));
     CHECK(hipMalloc(&dq_d, 2560 * 640 * 2));
     CHECK(hipMalloc(&d_ping, 4 << 20));
+    // the engine's VRAM state: ~8 GiB of session scratch held while the experts run (16 GiB budget)
+    void* pressure = nullptr;
+    if (pressure_gib > 0) {
+        const long long pb = pressure_gib * (1ll << 30);
+        if (hipMalloc(&pressure, (size_t) pb) != hipSuccess) {
+            std::fprintf(stderr, "igpu_gtt_micro: dequant arm: cannot hold %lld GiB: %s\n", pressure_gib,
+                         hipGetErrorString(hipGetLastError()));
+            return 2;
+        }
+        std::printf("igpu_gtt_micro: dequant arm: holding %lld GiB of device memory (engine-like pressure)\n",
+                    pressure_gib);
+    }
+    hipStream_t s = 0;
+    if (nb) {
+        if (hipStreamCreateWithFlags(&s, hipStreamNonBlocking) != hipSuccess) {
+            std::fprintf(stderr, "igpu_gtt_micro: dequant arm: stream: %s\n", hipGetErrorString(hipGetLastError()));
+            return 2;
+        }
+        std::printf("igpu_gtt_micro: dequant arm: non-BLOCKING stream (the engine's m.cs class)\n");
+    } else {
+        std::printf("igpu_gtt_micro: dequant arm: legacy stream (as in run 26)\n");
+    }
     // the engine's prefault: one full DMA read pass (4 MiB chunks) before any kernel touches the region
     const size_t chunk = 4ull << 20;
     for (long long off = 0; off < bytes; off += chunk)
@@ -511,9 +534,9 @@ int run_dequant_arm(long long gib) {
     std::printf("igpu_gtt_micro: dequant arm: prefault done, running the %d experts\n", kExperts);
     for (int e = 0; e < kExperts; ++e) {
         const uint8_t* b = (const uint8_t*) alias + (long long) e * (long long) blob;
-        strata::kernels::iq_dequant_gu_f16(kType, b, b + up_off, n_ff, n_embd, dq_gu, nullptr);
-        strata::kernels::iq_dequant_f16(kType, b + down_off, n_embd * n_ff, dq_d, nullptr);
-        const hipError_t err = hipStreamSynchronize(0);
+        strata::kernels::iq_dequant_gu_f16(kType, b, b + up_off, n_ff, n_embd, dq_gu, (void*) s);
+        strata::kernels::iq_dequant_f16(kType, b + down_off, n_embd * n_ff, dq_d, (void*) s);
+        const hipError_t err = hipStreamSynchronize(s);
         if (err != hipSuccess) {
             std::fprintf(stderr, "igpu_gtt_micro: dequant arm: expert %d failed: %s (blob at %p)\n", e,
                          hipGetErrorString(err), (const void*) b);
@@ -532,6 +555,8 @@ int run_dequant_arm(long long gib) {
     CHECK(hipFree(dq_gu));
     CHECK(hipFree(dq_d));
     CHECK(hipFree(d_ping));
+    if (pressure) CHECK(hipFree(pressure));
+    if (nb) (void) hipStreamDestroy(s);
     (void) hipHostUnregister(host);
     free(host);
     free(h);
@@ -562,6 +587,13 @@ int main(int argc, char** argv) {
             return run_scatter_arm((long long) std::atof(argv[i + 1]));
         if (std::strcmp(argv[i], "--alias") == 0 && i + 1 < argc)
             return run_alias_arm((long long) std::atof(argv[i + 1]));
+        if (std::strcmp(argv[i], "--dequant") == 0 && i + 1 < argc) {
+            bool nb = false;
+            long long pressure = 0;
+            if (i + 2 < argc && std::strcmp(argv[i + 2], "nb") == 0) nb = true;
+            if (i + 3 < argc) pressure = (long long) std::atof(argv[i + (nb ? 3 : 2)]);
+            return run_dequant_arm((long long) std::atof(argv[i + 1]), nb, pressure);
+        }
     }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;
     constexpr long long bytes = 1ll << 30;   // 1 GiB
