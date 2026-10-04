@@ -725,3 +725,34 @@ warmup - a null-stream throw.**
 
   Fix: the warmup creates a temporary stream, launches on it,
   stream-syncs (the load is what matters), destroys it.
+
+**Run 23 (2026-10-03 22:10, boot of 21:28): the module-load
+deadlock is FIXED; a new IMA surfaces in the expert section.**
+- "layer 1 PLE block done" printed for BOTH halves - the
+  native_ple_postops_batch launch that deadlocked in runs 16-21 now
+  completes (the init-time code-object warmup works).
+- Then: "prefill copy_i32: an illegal memory access" - a clean IMA
+  (the process self-terminates).  The last trace predates the
+  "experts begin" marker, so the fault is in the expert section's
+  first kernels - the grp_mapped copies
+  (copy_i32(m.grp_dev, m.ids, ...), copy_i32(m.slot_dev, m.grp_dev +
+  grp_tk, ...)): kernels that read/write m.grp_dev, the
+  cudaHostGetDevicePointer ALIAS of a small pinned host buffer.
+
+  Two things make this path suspect:
+  1. It is a branch the APU has never run - every copy-path run so far
+     had misses and took the staging-ring branch; the alias mode (zero
+     misses) is the first to take the grp_mapped host-grouping branch.
+  2. The micro tested kernel reads of registered host memory through
+     the HOST pointer, never through the device ALIAS.
+
+  (The error is sticky-async, so an earlier kernel - the layer-1 QSA
+  attention - could be the true fault site and the copy_i32 check only
+  the first to report it.  The A/B below separates that: if the IMA
+  moves with the grp path, the grp copies are it.)
+
+  The engine already has a bypass: STRATA_GROUP_COPY=1 skips the grp
+  allocation and uses plain cudaMemcpyAsync.  The micro gained
+  --alias (kernel read through the device alias of a pinned region).
+  Boot protocol 6: gate, --alias 8, engine alias arithmetic with
+  STRATA_GROUP_COPY=1 (chaining the smoke on a pass).

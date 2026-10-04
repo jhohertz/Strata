@@ -371,6 +371,43 @@ int run_scatter_arm(long long gib) {
     return 0;
 }
 
+// P1 alias arm: a kernel reading through the cudaHostGetDevicePointer ALIAS of a cudaHostAlloc region
+// (the engine's grp_mapped path does exactly this: copy_i32 kernels read/write m.grp_dev, the device alias
+// of a small pinned host buffer).  The --reg arm tested the host pointer; this tests the alias.
+int run_alias_arm(long long gib) {
+    const long long bytes = gib * (1ll << 30);
+    uint8_t* host = (uint8_t*) std::malloc(bytes);   // plain memory, then pinned - like cudaHostAlloc's result
+    if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib); return 2; }
+    std::memset(host, 0x5a, bytes);
+    if (hipHostRegister(host, (size_t) bytes, hipHostRegisterDefault) != hipSuccess) {
+        std::fprintf(stderr, "igpu_gtt_micro: register: %s\n", hipGetErrorString(hipGetLastError()));
+        return 2;
+    }
+    void* alias = nullptr;
+    if (hipHostGetDevicePointer(&alias, host, 0) != hipSuccess || alias == nullptr) {
+        std::fprintf(stderr, "igpu_gtt_micro: no device alias: %s (host=%p)\n", hipGetErrorString(hipGetLastError()),
+                     (void*) host);
+        return 2;
+    }
+    std::printf("igpu_gtt_micro: alias %lld GiB host=%p device-alias=%p%s\n", gib, (void*) host, alias,
+                alias == (void*) host ? " (identity)" : " (distinct mapping)");
+    const int kBlocks = 512;
+    uint32_t* d_partials = nullptr;
+    CHECK(hipMalloc(&d_partials, kBlocks * sizeof(uint32_t)));
+    CHECK(hipMemsetAsync(d_partials, 0, kBlocks * sizeof(uint32_t), 0));
+    const auto t0 = std::chrono::steady_clock::now();
+    xor_read_kernel<<<kBlocks, 256, 0, (hipStream_t) 0>>>((const float4*) alias, bytes / 16, d_partials);
+    CHECK(hipGetLastError());
+    CHECK(hipStreamSynchronize(0));
+    const long long ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::printf("A-alias   kernel read through the device alias: %7.1f GB/s  (%lld ms)\n",
+                (double) bytes / 1e9 / (ms / 1000.0), (long long) ms);
+    CHECK(hipFree(d_partials));
+    (void) hipHostUnregister(host);
+    return 0;
+}
+
 // P1 file arm: kernel reads of a whole mmap'd file, cold then warm, checksummed against the CPU.
 int run_file_arm(const char* path) {
     const int fd = ::open(path, O_RDONLY);
@@ -449,6 +486,8 @@ int main(int argc, char** argv) {
             return run_reg_after_dma_arm((long long) std::atof(argv[i + 1]));
         if (std::strcmp(argv[i], "--scatter") == 0 && i + 1 < argc)
             return run_scatter_arm((long long) std::atof(argv[i + 1]));
+        if (std::strcmp(argv[i], "--alias") == 0 && i + 1 < argc)
+            return run_alias_arm((long long) std::atof(argv[i + 1]));
     }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;
     constexpr long long bytes = 1ll << 30;   // 1 GiB
