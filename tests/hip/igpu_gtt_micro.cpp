@@ -474,7 +474,14 @@ int run_file_arm(const char* path) {
 // complement on a NON-BLOCKING stream.  Optional args: "nb" runs the dequants on a non-blocking
 // stream; a number holds that many GiB of device memory (the engine's ~8 GiB session scratch
 // pressure on the iGPU's 16 GiB budget).
-int run_dequant_arm(long long gib, bool nb, long long pressure_gib) {
+int run_dequant_arm(long long gib, bool nb, long long pressure_gib, bool thp, bool dev, bool pinned) {
+    // igpu-rework P2.1: the alias profile says the dequant reads 7.05 GiB in 8.0 s (0.95 GB/s) while
+    // a flat read of the same region runs at 54.7-82.6 GB/s.  This arm now TIMES the 512-expert
+    // dequant and can (thp) map the region with 2 MiB pages before registration, and (dev) copy the
+    // 512 blobs to a device buffer and dequant from there - the three numbers that say whether the
+    // slowness is the GTT (thp closes the gap), the TLB/page size, or the kernel's access pattern
+    // (dev matches GTT: the pattern is fine, the mapping is not; dev is much faster: the pattern is
+    // fine too and the mapping is the problem).
     constexpr int kExperts = 512;
     constexpr int kType = 42;   // Q2_0, this pack's gu_type and d_type
     constexpr int64_t n_ff = 640, n_embd = 2560;
@@ -485,21 +492,41 @@ int run_dequant_arm(long long gib, bool nb, long long pressure_gib) {
         return 2;
     }
     const long long bytes = gib * (1ll << 30);
-    uint8_t* host = (uint8_t*) std::malloc(bytes);
-    if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib);
-        return 2;
+    uint8_t* host = nullptr;
+    bool host_pinned_alloc = false;
+    if (pinned) {
+        // the engine's complement: cudaHostAlloc(Mapped|Portable) - driver page-locked memory
+        const hipError_t e = hipHostAlloc((void**) &host, (size_t) bytes, hipHostAllocMapped | hipHostAllocPortable);
+        if (e != hipSuccess || host == nullptr) {
+            std::fprintf(stderr, "igpu_gtt_micro: dequant arm: cudaHostAlloc %lld GiB: %s\n", gib, hipGetErrorString(e));
+            return 2;
+        }
+        host_pinned_alloc = true;
+        std::printf("igpu_gtt_micro: dequant arm: %lld GiB via cudaHostAlloc (the engine's mapping)\n", gib);
+    } else {
+        host = (uint8_t*) std::malloc(bytes);
+        if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib);
+            return 2;
+        }
     }
     for (long long off = 0; off < bytes; off += 4096)   // touch + a deterministic per-page pattern
         std::memset(host + off, (int) (((off >> 12) & 0xff) ^ 0x5a), 4096);
-    if (hipHostRegister(host, (size_t) bytes, hipHostRegisterDefault) != hipSuccess) {
+    if (thp) {
+        if (madvise(host, (size_t) bytes, MADV_HUGEPAGE) != 0)
+            std::fprintf(stderr, "igpu_gtt_micro: dequant arm: MADV_HUGEPAGE refused (continuing)\n");
+        else
+            std::printf("igpu_gtt_micro: dequant arm: region mapped with 2 MiB pages (THP)\n");
+    }
+    if (!host_pinned_alloc &&
+        hipHostRegister(host, (size_t) bytes, hipHostRegisterDefault) != hipSuccess) {
         std::fprintf(stderr, "igpu_gtt_micro: register: %s\n", hipGetErrorString(hipGetLastError()));
         return 2;
     }
     void* alias = nullptr;
     CHECK(hipHostGetDevicePointer(&alias, host, 0));
-    std::printf("igpu_gtt_micro: dequant arm: %lld GiB registered, alias=%p%s, %d experts x (gu %dx%d + d %dx%d)\n",
-                gib, alias, alias == (void*) host ? " (identity)" : "", kExperts, (int) n_ff, (int) n_embd, (int) n_embd,
-                (int) n_ff);
+    std::printf("igpu_gtt_micro: dequant arm: %lld GiB %s, alias=%p%s, %d experts x (gu %dx%d + d %dx%d)\n",
+                gib, host_pinned_alloc ? "pinned" : "registered", alias, alias == (void*) host ? " (identity)" : "",
+                kExperts, (int) n_ff, (int) n_embd, (int) n_embd, (int) n_ff);
     uint16_t* dq_gu = nullptr, *dq_d = nullptr, *d_ping = nullptr;
     CHECK(hipMalloc(&dq_gu, 1280 * 2560 * 2));
     CHECK(hipMalloc(&dq_d, 2560 * 640 * 2));
@@ -531,9 +558,21 @@ int run_dequant_arm(long long gib, bool nb, long long pressure_gib) {
     for (long long off = 0; off < bytes; off += chunk)
         CHECK(hipMemcpy(d_ping, host + off, (size_t) std::min<long long>(chunk, bytes - off), hipMemcpyHostToDevice));
     CHECK(hipDeviceSynchronize());
-    std::printf("igpu_gtt_micro: dequant arm: prefault done, running the %d experts\n", kExperts);
+    // dev: the same blobs in device memory - the copy path's read source, the kernel unchanged
+    const uint8_t* base = (const uint8_t*) alias;
+    uint8_t* d_blobs = nullptr;
+    if (dev) {
+        const long long bl = (long long) kExperts * (long long) blob;
+        CHECK(hipMalloc(&d_blobs, (size_t) bl));
+        CHECK(hipMemcpy(d_blobs, host, (size_t) bl, hipMemcpyHostToDevice));
+        base = d_blobs;
+        std::printf("igpu_gtt_micro: dequant arm: dequanting from a DEVICE buffer (H2D copy, %lld MiB)\n",
+                    bl >> 20);
+    }
+    std::printf("igpu_gtt_micro: dequant arm: running the %d experts (timed)\n", kExperts);
+    const auto dq0 = std::chrono::steady_clock::now();
     for (int e = 0; e < kExperts; ++e) {
-        const uint8_t* b = (const uint8_t*) alias + (long long) e * (long long) blob;
+        const uint8_t* b = base + (long long) e * (long long) blob;
         strata::kernels::iq_dequant_gu_f16(kType, b, b + up_off, n_ff, n_embd, dq_gu, (void*) s);
         strata::kernels::iq_dequant_f16(kType, b + down_off, n_embd * n_ff, dq_d, (void*) s);
         const hipError_t err = hipStreamSynchronize(s);
@@ -542,8 +581,12 @@ int run_dequant_arm(long long gib, bool nb, long long pressure_gib) {
                          hipGetErrorString(err), (const void*) b);
             return 1;
         }
-        if (e % 64 == 63) std::printf("  dequant arm: expert %d ok\n", e);
     }
+    const long long dq_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - dq0).count();
+    const double dq_gb = (double) kExperts * (double) blob / 1e9 / (dq_ms / 1000.0);
+    std::printf("igpu_gtt_micro: dequant arm: %d experts dequantized in %lld ms: %.2f GB/s read from %s%s%s\n",
+                kExperts, dq_ms, dq_gb, dev ? "device" : "GTT", thp ? "+THP" : "", nb ? "+nb" : "");
     // spot-check the outputs: the first 64 of each must be finite (the patterned input is not valid Q2_0,
     // so values are junk - this only proves the writes landed)
     uint16_t* h = (uint16_t*) std::malloc(2);
@@ -555,10 +598,14 @@ int run_dequant_arm(long long gib, bool nb, long long pressure_gib) {
     CHECK(hipFree(dq_gu));
     CHECK(hipFree(dq_d));
     CHECK(hipFree(d_ping));
+    if (d_blobs) CHECK(hipFree(d_blobs));
     if (pressure) CHECK(hipFree(pressure));
     if (nb) (void) hipStreamDestroy(s);
-    (void) hipHostUnregister(host);
-    free(host);
+    if (host_pinned_alloc) (void) hipFreeHost(host);
+    else {
+        (void) hipHostUnregister(host);
+        free(host);
+    }
     free(h);
     return 0;
 }
@@ -588,11 +635,18 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--alias") == 0 && i + 1 < argc)
             return run_alias_arm((long long) std::atof(argv[i + 1]));
         if (std::strcmp(argv[i], "--dequant") == 0 && i + 1 < argc) {
-            bool nb = false;
+            bool nb = false, thp = false, dev = false, pinned = false;
             long long pressure = 0;
-            if (i + 2 < argc && std::strcmp(argv[i + 2], "nb") == 0) nb = true;
-            if (i + 3 < argc) pressure = (long long) std::atof(argv[i + (nb ? 3 : 2)]);
-            return run_dequant_arm((long long) std::atof(argv[i + 1]), nb, pressure);
+            int j = i + 2;
+            while (j < argc) {
+                if (std::strcmp(argv[j], "nb") == 0) nb = true;
+                else if (std::strcmp(argv[j], "thp") == 0) thp = true;
+                else if (std::strcmp(argv[j], "dev") == 0) dev = true;
+                else if (std::strcmp(argv[j], "pinned") == 0) pinned = true;
+                else if (pressure == 0 && argv[j][0] >= '0' && argv[j][0] <= '9') pressure = (long long) std::atof(argv[j]);
+                ++j;
+            }
+            return run_dequant_arm((long long) std::atof(argv[i + 1]), nb, pressure, thp, dev, pinned);
         }
     }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;

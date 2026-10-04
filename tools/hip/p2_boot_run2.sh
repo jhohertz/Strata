@@ -5,7 +5,7 @@
 # Protocol: gate, then longfill alias with the old mmvq kernel, then arithmetic alias the same.
 # Both are checked against the golden tokens.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(cd "$(dirname "$0")/../.." && pwd)"
 O=/tmp/p2-out
 mkdir -p "$O"
 export STRATA_IGPU_ALIAS=1 STRATA_GROUP_COPY=1 STRATA_HIPBLASLT_WARMUP=1
