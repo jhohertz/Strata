@@ -2031,10 +2031,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                             release_to(m.g->n_expert);
                         }
-                    }
-                    if (hl_on) {
-                        cudaEventRecord(hl_b, m.cs);
-                        m.hostloop.push_back({ms_since(hl_t0), hl_a, hl_b});
+                        if (hl_on) {
+                            cudaEventRecord(hl_b, m.cs);
+                            m.hostloop.push_back({ms_since(hl_t0), hl_a, hl_b});
+                        }
                     }
                     if (checks_on && !xcheck("after the expert computes")) return false;
                     pt.mark(kPfCombine, cs);
@@ -2211,10 +2211,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // are complete here
         double host_sum = 0, gpu_sum = 0, host_max = 0, gpu_max = 0;
         for (auto& s : m.hostloop) {
-            double el = 0;
+            float el = 0;   // cudaEventElapsedTime takes a float*
             cudaEventSynchronize(s.b);
             cudaEventElapsedTime(&el, s.a, s.b);
-            host_sum += s.host_ms; gpu_sum += el; host_max = std::max(host_max, s.host_ms); gpu_max = std::max(gpu_max, el);
+            host_sum += s.host_ms; gpu_sum += (double) el;
+            host_max = std::max(host_max, s.host_ms);
+            gpu_max = std::max(gpu_max, (double) el);
             cudaEventDestroy(s.a);
             cudaEventDestroy(s.b);
         }

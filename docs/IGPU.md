@@ -1040,15 +1040,52 @@ readback - a GPU result corrupted by the fault) followed by the
 timeout kill.  Per protocol the box stops after this; the boot run for the
 hostloop measurement is queued below.
 
-### Queued (boot after the 04:2x flake): `p2_boot_run4.sh`
+### The 04:2x-12:5x failure cluster - and the build that never was
 
-Gate, then longfill alias with `STRATA_HOSTLOOP=1` (and, if clean,
-`STRATA_PREFILL_TIMING=1` in the same run - they compose).  The answer
-wanted: host ~ wall (launch-bound: the fix is fewer/batched launches and
-removing the per-layer ids D2H + full-stream sync) or gpu ~ wall with small
-host (the kernels are genuinely ~5 ms/expert on this APU: the fix is a
-different expert kernel shape, e.g. the fused path's per-token layout with a
-bigger group, or a dGPU-style grouped GEMM).
+Four consecutive 0.1.36 alias longfills faulted (04:2x, 12:1x, 12:3x, 12:5x),
+all with the known site-moves signature: corrupted layer-0 ids readback (x2),
+then `prefill gather_rows16: unspecified launch failure` right after the
+9/9 hipBLASLt warmup, then teardown hangs (`hipModuleUnload failed`, timeout
+kill).  dmesg: `device wedged, but recovered through reset` (the driver's GPU
+reset succeeds - a new process can run after it, which the 0.1.29 contrast run
+proved).
+
+The first two were attributed to the new `STRATA_HOSTLOOP` instrumentation -
+**wrong**.  The instrumented build never compiled: `hl_on`/`hl_a`/`hl_b`/`hl_t0`
+were declared inside the host-grouping branch but used at a scope outside it
+(the walk's `if (!stream_all)/else` closes before the push site), plus a
+cudaEventElapsedTime float*/double* mismatch.  The 04:2x `make` failed with
+exactly that error, but the command pipeline (`make | grep ... && run`) let the
+run proceed against the **pre-instrumentation** binary (grep's exit status
+masked make's).  All four failures were the original 0.1.36 binary, two of
+them with the debug env off.  (The instrumentation is now fixed and actually
+builds; `p2_boot_run4.sh` still runs it, unchanged.)
+
+Corrected record, same machine:
+
+| binary | longfills | faults |
+|---|---|---|
+| 0.1.36 alias (original) | 10 (2 boots) | 4 (all since 04:2x) |
+| 0.1.29 copy (41da073 worktree) | 4 (2 boots) | 0 |
+
+The fault sites are unrelated kernels (BLAS warmup solution, layer-0 router
+ids, gather_rows16, copy_i32, iq_dequant_gu_f16 over the whole 0.1.31-0.1.36
+history) - the site-moves signature of the chronic APU/driver flake, now
+clustering: 7/7 clean 0.1.36 runs on one boot, then 4/4 faults across the
+next two boots with 0.1.29 clean in between.  Whatever degrades the APU for
+this engine's workload does not reset with a simple reboot, or the 0.1.36
+prompt path trips a driver state the 0.1.29 path never enters.  Unresolved;
+needs a longer clean period and the A/B below, not more same-day runs.
+
+### Queued (after a full reboot, ideally one idle period): `p2_boot_run4.sh`
+
+Gate, then longfill alias with `STRATA_HOSTLOOP=1` (the instrumentation now
+compiles) + `STRATA_PREFILL_TIMING=1`.  If the health run faults again, stop
+and A/B `STRATA_HIPBLASLT_WARMUP=0` (the fault has now touched the warmup
+window twice) before spending another boot.  The answer wanted: host ~ wall
+(launch-bound: batch launches, remove the per-layer ids D2H + full-stream
+sync) or gpu ~ wall with small host (the kernels are genuinely ~5 ms/expert:
+a different expert kernel shape).
 
 ### Reboot log (the long tail)
 
