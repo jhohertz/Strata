@@ -14,12 +14,29 @@ export STRATA_OLD_IQ_MMVQ=1
 
 step() { echo "=== P2.2 [$1] $(date '+%H:%M:%S') ===" | tee -a "$O/run.log"; }
 
+# prep writes smoke_ids.json (keys: arithmetic, python, marker, longfill); the engine runs need
+# flat .ids files.  Extract once per boot so a wiped /tmp is self-healing.
+need_ids() {
+    if [ ! -f "$O/$1" ]; then
+        [ -f "$O/smoke_ids.json" ] || python3 tools/hip/gfx1103_smoke.py prep packs/qwen38-flash-next-q2_0 "$O" >&2
+        key="${1%.ids}"
+        python3 - "$O" "$key" "$1" <<'EOF'
+import json, sys
+o, key, fname = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(o + "/smoke_ids.json"))[key]
+ids = d if isinstance(d, str) else " ".join(map(str, d))
+open(o + "/" + fname, "w").write(ids)
+EOF
+    fi
+    cat "$O/$1"
+}
+
 step gate
 ./build-hip/hip_intrinsics || { echo "gate failed - stop" | tee -a "$O/run.log"; exit 1; }
 sleep 60
 
 step longfill old-mmvq
-IDS=$(cat "$O/lf.ids"); [ -f "$O/lf.ids" ] || { python3 tools/hip/gfx1103_smoke.py prep packs/qwen38-flash-next-q2_0 "$O" >/dev/null 2>&1; IDS=$(cat "$O/lf.ids"); }
+IDS=$(need_ids longfill.ids)
 timeout 900 ./build-hip/strata --pack packs/qwen38-flash-next-q2_0 \
   --native /home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
   --ple-gguf /home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
@@ -31,7 +48,7 @@ python3 tools/hip/gfx1103_smoke.py check packs/qwen38-flash-next-q2_0 "$O/lf-old
 sleep 90
 
 step arithmetic old-mmvq
-IDS=$(cat "$O/ar.ids")
+IDS=$(need_ids arithmetic.ids)
 timeout 900 ./build-hip/strata --pack packs/qwen38-flash-next-q2_0 \
   --native /home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
   --ple-gguf /home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
