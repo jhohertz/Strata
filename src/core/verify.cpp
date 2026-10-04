@@ -208,7 +208,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
-    if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
+    // igpu-rework P1 run 29: an alias cache has no arena - cache_base is null and cache_blob is 0, but
+    // slot_off carries the per-slot host pointers (cache's host pointer table), so every "base + offset"
+    // resolution in the graph reduces to the pointer itself.  Accept that tier: the residency table plus
+    // either an arena (cache_base and per-slot blob) or the pointer table (slot_off).
+    if (hits.d_res == nullptr || (hits.cache_base == nullptr && hits.slot_off == nullptr) ||
+        (hits.slot_off == nullptr && hits.blob <= 0)) {
         err = "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
               "--expert-cache auto, no VRAM was left for it: lower --max-context, use --kv k8v4 or images on the CPU";
         return false;

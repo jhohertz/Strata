@@ -778,3 +778,118 @@ innocent; the IMA moved; the hang was an unreported async IMA.**
   upload / after the expert computes / after moe_combine) - an async
   IMA now reports its section and layer and exits instead of hanging
   900 s.
+
+## P1 result: the alias path works (runs 25-29, boots 2026-10-03 22:48 - 2026-10-04 02:22)
+
+The expert-section IMA of runs 23-28 took five more boots to find, and it was
+not a driver bug at all.
+
+**Run 25 (MMQ off).** With STRATA_PREFILL_MMQ=0 the fault moved into the
+non-MMQ subpath ("after the f16 products"), which ruled out the mmq gemm and
+the ggml context pool.  dmesg finally showed the fault's shape:
+`GCVM_L2_PROTECTION_FAULT_STATUS` gfxhub page faults at GPU VA 0x0, 0x1000,
+0x2000, ... 0x6000 (4 KiB pages, PERMISSION_FAULTS 0x3, client 10/TCP) plus
+`sq_intr type 2` - a NULL-base read, identical in the MMQ-on and MMQ-off
+runs.
+
+**Run 26 (the micro reproduces the workload).** A new `igpu_gtt_micro
+--dequant <gib>` arm runs the engine's exact layer-0 dequant workload - 512
+experts, each `iq_dequant_gu_f16` + `iq_dequant_f16` (Q2_0, n_ff=640,
+n_embd=2560, the real 1,382,400 B blob with gate at 0, up at 460800, down at
+921600 = `native_expert_layout`) - over a registered region after the
+engine's 4 MiB-chunked prefault.  It PASSED (512/512, clean APU), so the
+kernels and the GTT reads were exonerated.  The engine with per-kernel checks
+failed at "layer 0 after dequant gu" - the same kernel the micro had just
+passed.
+
+**Run 27 (stream and pressure are innocent).** Micro variants: `nb`
+(non-blocking stream, the engine's m.cs class) - PASS.  `nb` + 6 GiB of held
+device memory (the engine's session-scratch pressure on the 16 GiB budget) -
+PASS.  The engine with the new env-gated blocking compute stream
+(STRATA_IGPU_BLOCKING_CS=1) still failed at the same check.
+
+**Run 28 (scale and the smoking gun).** Micro `--dequant 32 nb 6` - a
+32 GiB registered region (the engine's complement scale) with the nb stream
+and the pressure - PASS.  Scale is innocent.  The engine's first-compute
+pointer dump (moved before the launch; run 26's had sat after the fault
+point and never printed) finally printed the launch's actual arguments:
+
+    blob=(nil) blob+up=0x70800 dq_gu=0x75367b200000 ... (all valid)
+    fmt gu=42 d=42 up_off=460800 down_off=921600 host_res=0
+
+`blob_dev` - the expert pointer from the alias table - was NULL, while every
+other pointer was a valid device VA.  The dequant read the gate region from
+base 0 and the up region from 0x70800: the dmesg "NULL-base" fault was a
+literal NULL pointer all along.
+
+**Root cause.** `ExpertCache::set_aliased_pointers` (the batch table fill)
+uploads the 24,576 pointers to `d_ptrs_` (device) and verifies the read-back,
+but never filled `h_ptrs_` (host), which is the table `device_slot()` - the
+prompt path's lookup - reads.  `h_ptrs_` sat at its `open_aliased` zeros, so
+every prompt-path `device_slot()` returned NULL.  The decode path uses
+`d_ptrs_` (verified, correct), which is why the table "looked" right and the
+failure only ever appeared in the prompt's expert section.  The per-slot
+`fill_slot` updates both tables; the batch fill forgot the host mirror.  One
+line: `h_ptrs_.assign(host_pointers, host_pointers + n)` after the read-back
+verification.
+
+**Run 29 (P1 works).** With the fixed table, the prompt ran end to end for
+the first time: 48 layers, 5110 resident expert computes, 0 staged, 0 blob
+reads from the file.  Decode then needed one more line: the verify graph's
+init guard rejected the alias tier (`cache_base == nullptr`), even though the
+alias design (base null + `slot_off` = the per-slot host pointers, so every
+"base + offset" resolution reduces to the pointer itself) was already wired
+through the pool's plan builder (`drive.d.cache_slot_off =
+xcache.slot_offsets()`, which returns the host pointer table in alias mode)
+and `TokenHits::on()`.  The guard now accepts residency + either an arena or
+the pointer table.  That was the last blocker.
+
+All four Phase-B smokes pass in alias mode (STRATA_IGPU_ALIAS=1,
+STRATA_GROUP_COPY=1, MMQ on, Q2_0 native pack, this machine):
+
+| case      | verdict | checks on | checks off (clean) |
+|-----------|---------|-----------|--------------------|
+| arithmetic| 396 OK  | 11.4 pf / 12.9 dec tok/s | 12.4 pf / 11.8 dec tok/s |
+| python    | OK      | 14.8 dec tok/s | - |
+| marker    | OK      | 8.1 dec tok/s  | - |
+| longfill  | 724913 OK | 35.9 pf / 20.5 dec tok/s | **38.9 pf / 20.5 dec tok/s** |
+
+Prefill on the 1162-token prompt is 38.9 tok/s clean, against the 0.1.36
+copy path's 34.7-37.95 on the same prompt, and decode 20.5 against the copy
+path's 18.75-19.52.  The alias path removes the H2D expert copies entirely
+(the run reports "0 exchanged with the VRAM tier, 0 blob reads from the
+file"), but the prefill is not 2x faster: the earlier analysis found ~20.6 s
+of ~31.3 s per prompt is host-side work (per-token PLE block, routing,
+window handling), which the alias does not touch.  That is P2/P4
+(collapsing the ring/flag waits, shrinking the CPU pool's surface).
+
+Short-prompt prefill is still slow (44 tokens in 3.5 s, ~80 ms/token): with
+one chunk the per-token host work is the whole prompt.  Also P2.
+
+### What P1 left behind
+
+- The alias path needs `--mmap-experts` (the complement is built from the
+  file source), a file-backed pack, and runs with a 31.64 GiB
+  page-locked + registered + prefaulted RAM complement and a 192 KiB device
+  pointer table; the iGPU's 16 GiB VRAM budget then holds the session
+  (~8 GiB) and the graph buffers.
+- The debug machinery is gated and dGPU-untouched: STRATA_PREFILL_CHECKS
+  (named section checks, now per-kernel in the expert compute),
+  STRATA_GROUP_COPY, STRATA_HIPBLASLT_WARMUP, STRATA_IGPU_BLOCKING_CS,
+  STRATA_TRACE (per-layer/per-section traces + the first-compute pointer
+  dump), the PLE code-object warmup at init, and the 4 MiB-chunked
+  complement prefault pass.
+- The micro's `--dequant` arm (with `nb` and pressure options) stays: it is
+  the engine's expert-section workload in a process without the engine, and
+  it is what kept every hypothesis testable without burning a boot.
+
+### Reboot log (the long tail)
+
+Runs 23-29 were one IMA and eight reboots.  The sequence that worked, for
+the record: dmesg first (the fault address beat every black-box guess),
+then a micro that replicates the exact workload (kernel + geometry + GTT
+state), then the one-shot pointer dump placed before the launch.  The three
+reboots in between (25-28) each killed one suspect: the mmq path, the stream
+type, and the VRAM/scale state.  All three turns out to have been innocent
+of the actual bug (a missing `h_ptrs_` assignment) - but the dump that
+proved it was built by the boot that came before them.
