@@ -611,6 +611,105 @@ int run_dequant_arm(long long gib, bool nb, long long pressure_gib, bool thp, bo
 }
 
 
+// igpu-rework P2.4: the engine's gather phase, in a process without the engine.  The 0.1.36 alias
+// profile's "dequant" phase (8.0 s, 26 %) actually contains the MMQ-on gather: per expert, one
+// copy16_kernel launch (gate+up -> group gu slot, down -> group d slot), GTT read + VRAM write.
+// This arm replays the exact kernel (copied from src/prefill/moe_mmq.cu) over 512 contiguous
+// 1.38 MB blobs in the engine's pinned complement mapping, back-to-back launches as the engine's
+// compute() does, and times it - plus one flat copy of the same total bytes.  Per-expert ~= flat:
+// the 8.0 s is host launch gaps (batch the gathers); per-expert ~= 1.8 GB/s: the pattern is the
+// problem.
+__global__ void micro_copy16_kernel(const uint4* __restrict__ a, int64_t na, const uint4* __restrict__ b, int64_t nb,
+                                    uint4* __restrict__ ab_dst, const uint4* __restrict__ c, int64_t nc,
+                                    uint4* __restrict__ c_dst) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < na) ab_dst[i] = a[i];
+    else if (i < na + nb) ab_dst[i] = b[i - na];
+    else if (i < na + nb + nc) c_dst[i - na - nb] = c[i - na - nb];
+}
+
+int run_gather_arm(long long gib, bool pinned, bool nb) {
+    constexpr int kExperts = 512;
+    constexpr size_t half = 460800, blob = 1382400;   // gate | up | down, Q2_0 640x2560 / 2560x640
+    const long long bytes = gib * (1ll << 30);
+    if (bytes < (long long) kExperts * (long long) blob + (1ll << 30)) {
+        std::fprintf(stderr, "igpu_gtt_micro: --gather needs >= 1 GiB\n");
+        return 2;
+    }
+    uint8_t* host = nullptr;
+    if (pinned) {
+        const hipError_t e = hipHostAlloc((void**) &host, (size_t) bytes, hipHostAllocMapped | hipHostAllocPortable);
+        if (e != hipSuccess || host == nullptr) {
+            std::fprintf(stderr, "igpu_gtt_micro: gather arm: cudaHostAlloc %lld GiB: %s\n", gib, hipGetErrorString(e));
+            return 2;
+        }
+    } else {
+        host = (uint8_t*) std::malloc(bytes);
+        if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib); return 2; }
+    }
+    for (long long off = 0; off < bytes; off += 4096) std::memset(host + off, (int) (((off >> 12) & 0xff) ^ 0x5a), 4096);
+    if (!pinned && hipHostRegister(host, (size_t) bytes, hipHostRegisterDefault) != hipSuccess) {
+        std::fprintf(stderr, "igpu_gtt_micro: gather arm: register: %s\n", hipGetErrorString(hipGetLastError()));
+        return 2;
+    }
+    void* alias = nullptr;
+    CHECK(hipHostGetDevicePointer(&alias, host, 0));
+    const uint8_t* base = (const uint8_t*) alias;
+    uint8_t* d_gu = nullptr;   // group gu slot per expert: 2*half
+    uint8_t* d_d = nullptr;    // group d slot per expert: half
+    CHECK(hipMalloc(&d_gu, 2 * half * kExperts));
+    CHECK(hipMalloc(&d_d, half * kExperts));
+    uint8_t* d_flat = nullptr; // one full blob per expert: the flat copy's destination
+    CHECK(hipMalloc(&d_flat, blob * kExperts));
+    hipStream_t s = 0;
+    if (nb) CHECK(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
+    // the engine's prefault: one full DMA read pass over the expert region
+    uint8_t* ping = nullptr;
+    CHECK(hipMalloc(&ping, 4 << 20));
+    for (long long off = 0; off < (long long) kExperts * (long long) blob; off += 4ull << 20)
+        CHECK(hipMemcpy(ping, host + off, (size_t) std::min<long long>(4ll << 20, (long long) kExperts * (long long) blob - off),
+                        hipMemcpyHostToDevice));
+    CHECK(hipDeviceSynchronize());
+    const int64_t na = half / 16, nc = half / 16;
+    std::printf("igpu_gtt_micro: gather arm: %d experts x 1.38 MB, %s mapping%s, timing per-expert launches\n", kExperts,
+                pinned ? "pinned (the engine's complement)" : "registered", nb ? " + nb" : "");
+    const auto g0 = std::chrono::steady_clock::now();
+    for (int e = 0; e < kExperts; ++e) {
+        const uint8_t* b = base + (long long) e * (long long) blob;
+        micro_copy16_kernel<<<(unsigned) ((2 * na + nc + 255) / 256), 256, 0, s>>>((const uint4*) b, na, (const uint4*) (b + half),
+                                                                                  na, (uint4*) (d_gu + (long long) e * 2 * half),
+                                                                                  (const uint4*) (b + 2 * half), nc,
+                                                                                  (uint4*) (d_d + (long long) e * half));
+    }
+    CHECK(hipStreamSynchronize(s));
+    const long long g_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g0).count();
+    const double total_bytes = (double) kExperts * (double) blob;
+    std::printf("igpu_gtt_micro: gather arm: %d per-expert gathers in %lld ms: %.2f GB/s (GTT read + VRAM write)\n",
+                kExperts, g_ms, total_bytes / 1e9 / (g_ms / 1000.0));
+    // the same total bytes in ONE flat copy: the rate the hardware can sustain on this mapping
+    const auto f0 = std::chrono::steady_clock::now();
+    const int64_t flat = ((long long) kExperts * (long long) blob) / 16;
+    micro_copy16_kernel<<<(unsigned) ((flat + 255) / 256), 256, 0, s>>>((const uint4*) host, flat, nullptr, 0, (uint4*) d_flat,
+                                                                        nullptr, 0, nullptr);
+    CHECK(hipStreamSynchronize(s));
+    const long long f_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - f0).count();
+    std::printf("igpu_gtt_micro: gather arm: one flat copy of the same bytes in %lld ms: %.2f GB/s\n", f_ms,
+                total_bytes / 1e9 / (f_ms / 1000.0));
+    CHECK(hipFree(ping));
+    CHECK(hipFree(d_gu));
+    CHECK(hipFree(d_d));
+    CHECK(hipFree(d_flat));
+    if (nb) (void) hipStreamDestroy(s);
+    if (pinned) (void) hipFreeHost(host);
+    else {
+        (void) hipHostUnregister(host);
+        free(host);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--file") == 0 && i + 1 < argc) return run_file_arm(argv[i + 1]);
@@ -647,6 +746,14 @@ int main(int argc, char** argv) {
                 ++j;
             }
             return run_dequant_arm((long long) std::atof(argv[i + 1]), nb, pressure, thp, dev, pinned);
+        }
+        if (std::strcmp(argv[i], "--gather") == 0 && i + 1 < argc) {
+            bool pinned = true, nb = false;   // pinned = the engine's complement mapping
+            for (int j = i + 2; j < argc; ++j) {
+                if (std::strcmp(argv[j], "reg") == 0) pinned = false;
+                else if (std::strcmp(argv[j], "nb") == 0) nb = true;
+            }
+            return run_gather_arm((long long) std::atof(argv[i + 1]), pinned, nb);
         }
     }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;

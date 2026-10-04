@@ -329,6 +329,11 @@ struct Stager {
 };
 
 struct Prefill::Impl {
+    // STRATA_HOSTLOOP=1 (igpu-rework P2.4): the expert section (host grouping -> moe_combine) per layer,
+    // host wall time vs the GPU span on the compute stream.  host ~ wall: launch-bound; gpu ~ wall with
+    // small host: the kernels are slow.  (debug only; dGPU path untouched - nothing prints without the env)
+    struct HostLoopSample { double host_ms; cudaEvent_t a; cudaEvent_t b; };
+    std::vector<HostLoopSample> hostloop;
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -1747,6 +1752,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     } else {
                         // group the (token, k) pairs by expert on the host
                         pt.mark(kPfHostGroup, cs);
+                        bool hl_on = false;
+                        cudaEvent_t hl_a = nullptr, hl_b = nullptr;
+                        if (static const bool hle = std::getenv("STRATA_HOSTLOOP") != nullptr; hle) {
+                            hl_on = true;
+                            if (cudaEventCreate(&hl_a) == cudaSuccess && cudaEventCreate(&hl_b) == cudaSuccess)
+                                cudaEventRecord(hl_a, m.cs);
+                            else {
+                                hl_on = false;
+                                if (hl_a) cudaEventDestroy(hl_a);
+                                if (hl_b) cudaEventDestroy(hl_b);
+                            }
+                        }
+                        const auto hl_t0 = Clock::now();
                         // (the sync below also orders this layer's writes of slot/src/bounds after the previous
                         // layer's kernels that read them)
                         const bool grp_mapped = m.grp_host != nullptr;
@@ -2014,6 +2032,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             release_to(m.g->n_expert);
                         }
                     }
+                    if (hl_on) {
+                        cudaEventRecord(hl_b, m.cs);
+                        m.hostloop.push_back({ms_since(hl_t0), hl_a, hl_b});
+                    }
                     if (checks_on && !xcheck("after the expert computes")) return false;
                     pt.mark(kPfCombine, cs);
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
@@ -2183,6 +2205,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             line += h;
         }
         std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
+    }
+    {
+        // STRATA_HOSTLOOP=1: the section timers - the stream is synced at every chunk end, so all events
+        // are complete here
+        double host_sum = 0, gpu_sum = 0, host_max = 0, gpu_max = 0;
+        for (auto& s : m.hostloop) {
+            double el = 0;
+            cudaEventSynchronize(s.b);
+            cudaEventElapsedTime(&el, s.a, s.b);
+            host_sum += s.host_ms; gpu_sum += el; host_max = std::max(host_max, s.host_ms); gpu_max = std::max(gpu_max, el);
+            cudaEventDestroy(s.a);
+            cudaEventDestroy(s.b);
+        }
+        if (!m.hostloop.empty())
+            std::fprintf(stderr, "strata prefill hostloop: %zu expert sections, host %.0f ms, gpu span %.0f ms "
+                                 "(max section host %.1f / gpu %.1f ms)\n",
+                         m.hostloop.size(), host_sum, gpu_sum, host_max, gpu_max);
+        m.hostloop.clear();
     }
     return true;
 }

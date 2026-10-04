@@ -999,6 +999,57 @@ time from host inter-launch gaps - if the kernel streams at the ~54 GB/s a
 flat copy gets, the 8.0 s is launch overhead and the fix is batching;
 if it is ~1.8 GB/s like the pool, the MMQ gather pattern is the problem.
 
+## P2.4: the gather micro, the expert-path A/Bs, and the host/GPU separation (2026-10-04)
+
+**The gather micro (`--gather` arm):** 512 per-expert `copy16_kernel`
+launches (the engine's exact kernel, from `src/prefill/moe_mmq.cu`) over the
+pinned complement mapping, back-to-back as the engine's compute loop does:
+
+| micro | rate |
+|---|---|
+| 512 per-expert gathers (GTT read + VRAM write) | 33.70 GB/s (21 ms) |
+| one flat copy of the same bytes | 39.32 GB/s (18 ms) |
+
+The per-expert launch pattern costs only ~9 % vs flat.  The engine's same
+work runs at 0.95 GB/s - **35x slower than the micro's 33.7**.  The kernel
+and the mapping are both fast in isolation; the engine's expert section is
+spending its 8.0 s somewhere else.
+
+**The expert-path A/Bs (all alias, longfill, same boot):**
+
+| variant | prefill |
+|---|---|
+| MMQ on (default) | 38.9 / 39.1 tok/s (30551 / 29736 ms) |
+| `STRATA_PREFILL_MMQ=0` (f16 dequant + tuned hipBLASLt) | 39.0 tok/s (29788 ms) |
+| `STRATA_PF_FUSED=1` (0.1.36's fused Q2_0 prompt experts) | 38.6 tok/s (30096 ms) |
+
+**Every expert compute path lands at ~39 tok/s.**  The total prefill is not
+sensitive to which kernels do the expert math - so the ~30.5 s wall is set by
+something shared (per-expert dispatch, per-layer syncs, or the non-expert
+phases), not by the gemm choice.  This also reframes the "gemm gate/up 39 %"
+phase: with MMQ off the same wall has no gemm phases at all, yet the total
+is identical.
+
+**The host/GPU separation (queued, then the flake):** added `STRATA_HOSTLOOP=1`
+(gated, dGPU-untouched): per expert section (host grouping -> moe_combine)
+it records the host wall time and the GPU span (two events on the compute
+stream) and prints the sums at prompt end.  The first run died to the known
+APU flake mid-way: `prefill: routed id out of range` (the per-layer ids
+readback - a GPU result corrupted by the fault) followed by the
+`hipModuleUnload failed: unspecified launch failure` teardown hang until the
+timeout kill.  Per protocol the box stops after this; the boot run for the
+hostloop measurement is queued below.
+
+### Queued (boot after the 04:2x flake): `p2_boot_run4.sh`
+
+Gate, then longfill alias with `STRATA_HOSTLOOP=1` (and, if clean,
+`STRATA_PREFILL_TIMING=1` in the same run - they compose).  The answer
+wanted: host ~ wall (launch-bound: the fix is fewer/batched launches and
+removing the per-layer ids D2H + full-stream sync) or gpu ~ wall with small
+host (the kernels are genuinely ~5 ms/expert on this APU: the fix is a
+different expert kernel shape, e.g. the fused path's per-token layout with a
+bigger group, or a dGPU-style grouped GEMM).
+
 ### Reboot log (the long tail)
 
 Runs 23-29 were one IMA and eight reboots.  The sequence that worked, for
