@@ -883,6 +883,77 @@ one chunk the per-token host work is the whole prompt.  Also P2.
   the engine's expert-section workload in a process without the engine, and
   it is what kept every hypothesis testable without burning a boot.
 
+## P2.1: profile the alias prefill before optimizing it (P2.1, 2026-10-04)
+
+The pre-P1 "20.6 s of 31.3 s is host-side" estimate predated alias mode, so P2
+starts by re-measuring.  `STRATA_PREFILL_TIMING=1` (existing) gives the phase
+breakdown; `tools/hip/p2_boot_run1.sh` ran longfill + arithmetic in alias mode.
+
+| case | tokens | prefill | decode |
+|---|---|---|---|
+| longfill | 1162 | 30551.6 ms (38.0 tok/s), TTFT 31036 ms | 160 in 7819.8 ms (20.5 tok/s) |
+| arithmetic | 44 | 3594.6 ms (12.2 tok/s), TTFT 4082 ms | 160 in 13684.5 ms (11.7 tok/s) |
+
+**The alias prefill is GPU-bound, not host-bound.**  `GPU timeline == wall`
+(30551 = 30551 ms); host staging 0 ms, host chunk setup 12 ms, PLE 9 ms.  The
+old P2 target (host-side work) does not apply: the GPU is busy the entire
+prompt.  (The 20.6 s estimate was of the copy path, whose H2D copies are now
+gone.)  The phase split (longfill): gemm gate/up 12050 ms (39.4 %), "dequant"
+7996 ms (26.2 %), gemm down 3938 ms (12.9 %), qsa 3213 (10.5 %), gdn 2413
+(7.9 %), hc read 1271 (4.2 %), ple 1301 (4.3 %).
+
+"Dequant" at 0.95 GB/s (7.05 GiB read in 8.0 s) looked like a GTT problem,
+but the `--dequant` micro arm (512 experts, Q2_0, real blob geometry) measures
+the dequant kernel in isolation:
+
+| micro variant | read rate |
+|---|---|
+| GTT, malloc + hipHostRegister (legacy stream) | 6.32 GB/s |
+| GTT + MADV_HUGEPAGE | 6.26 GB/s (huges refused) |
+| device memory (H2D-copied blobs) | 7.53 GB/s |
+| GTT, non-blocking stream (`nb`) | 6.26 GB/s |
+| GTT, cudaHostAlloc (the engine's complement mapping) | 6.26 GB/s |
+
+**Mapping kind, page size, stream type and pressure are all innocent**: the
+engine's exact mapping (cudaHostAlloc, identity alias) dequants at the same
+6.26 GB/s the micro gets everywhere.  The kernel's access pattern itself is
+slow in isolation (single-digit GB/s) but that is not the engine's gap: the
+engine runs the same kind of work ~7x slower (0.95 vs 6.3 GB/s).
+
+The gap closed on re-reading the profile: with MMQ on (this run's mode), the
+`kPfDequant` phase in `compute()` is marked at the top of the lambda and the
+next mark is the group product - so **the "dequant" phase actually contains
+the `gather_native` copies (GTT read + VRAM write, 16 experts per group), not
+`iq_dequant_gu_f16`**.  7996 ms = 5110 gathers of 1.38 MB (7.05 GiB read +
+7.05 GiB written) plus the inter-launch gaps.  The next P2 measurement is a
+micro arm for `gather_native` itself, to split kernel time from host launch
+gaps.
+
+### The 0.1.29 baseline and the mmvq A/B
+
+The -46 % prefill regression vs 0.1.29 (commit 2c110cd) was queued with
+`STRATA_OLD_IQ_MMVQ=1` as the single lever.  Verified from git: 0.1.29's
+expert `compute()` lambda is byte-identical to 0.1.36's, the llama.cpp pin is
+the same commit in both (`3cf03257`), and the Q2_0 MMQ build is unchanged -
+so the regression is not in the expert gemm path.  `p2_boot_run2.sh` runs the
+A/B.  First pass (this boot): arithmetic PASS 396 with the old mmvq, prefill
+3536.3 ms (12.4 tok/s) vs the 3594.6 ms (12.2 tok/s) baseline - **no
+change**: the mmvq kernel is not the prefill regression (at least for the
+short prompt).  longfill faulted in the hipBLASLt warmup on this pass
+(`unspecified launch failure`, 719) - the known flake, now seen once on the
+alias path (previously only on the copy path; the site moves, here a BLAS
+solution launch).  Arithmetic ran clean at normal speed after the fault,
+which is a data point on the flake's aftermath, not a license to keep going:
+reboot per protocol before the A/B's longfill.
+
+## P2.2 (queued, boot after the 03:44 flake): the mmvq A/B, clean boot
+
+`p2_boot_run2.sh` again: gate, longfill alias + `STRATA_OLD_IQ_MMVQ=1`, then
+arithmetic.  If the warmup faults again, run both A/B variants with
+`STRATA_HIPBLASLT_WARMUP=0` (fair, and it removes the fault-prone warmup from
+the path) and record that.  Either way the A/B answers: is the -46 % prefill
+regression (and possibly the flake) in the new `iq_mmVQ` kernel?
+
 ### Reboot log (the long tail)
 
 Runs 23-29 were one IMA and eight reboots.  The sequence that worked, for
