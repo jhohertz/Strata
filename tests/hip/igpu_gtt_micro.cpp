@@ -18,6 +18,8 @@
 // Prints GB/s per arm (median and min/max over the iterations) and the checksum verdict.
 #include <hip/hip_runtime.h>
 
+#include "strata/kernels/iq_kernels.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -464,6 +466,78 @@ int run_file_arm(const char* path) {
     std::printf("igpu_gtt_micro: file arm done (cold %s, warm %s)\n", ok1 ? "OK" : "BAD", ok2 ? "OK" : "BAD");
     return ok1 && ok2 ? 0 : 3;
 }
+
+// igpu-rework P1 run 26: the engine's alias runs IMA in the expert section (dmesg: NULL-base reads,
+// GPU VA 0x0-0x6000).  This arm replicates layer 0's exact dequant workload - 512 experts, each
+// iq_dequant_gu_f16 + iq_dequant_f16 (Q2_0, n_ff=640, n_embd=2560, blob 1,382,400 B with gate at 0,
+// up at 460800, down at 921600 - native_expert_layout) reading a GTT-registered anonymous region the
+// way the alias cache's complement is read, after the same full DMA prefault pass.  Reproducing it
+// here means the bug is in the kernels/GTT interaction and can be bisected without an engine boot.
+int run_dequant_arm(long long gib) {
+    constexpr int kExperts = 512;
+    constexpr int kType = 42;   // Q2_0, this pack's gu_type and d_type
+    constexpr int64_t n_ff = 640, n_embd = 2560;
+    constexpr size_t up_off = 460800, down_off = 921600, blob = 1382400;
+    const long long need = (long long) kExperts * (long long) blob + (1ll << 30);
+    if (gib * (1ll << 30) < need) { std::fprintf(stderr, "igpu_gtt_micro: --dequant needs %.2f GiB\n",
+                                                 (double) need / 1073741824.0);
+        return 2;
+    }
+    const long long bytes = gib * (1ll << 30);
+    uint8_t* host = (uint8_t*) std::malloc(bytes);
+    if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib);
+        return 2;
+    }
+    for (long long off = 0; off < bytes; off += 4096)   // touch + a deterministic per-page pattern
+        std::memset(host + off, (int) (((off >> 12) & 0xff) ^ 0x5a), 4096);
+    if (hipHostRegister(host, (size_t) bytes, hipHostRegisterDefault) != hipSuccess) {
+        std::fprintf(stderr, "igpu_gtt_micro: register: %s\n", hipGetErrorString(hipGetLastError()));
+        return 2;
+    }
+    void* alias = nullptr;
+    CHECK(hipHostGetDevicePointer(&alias, host, 0));
+    std::printf("igpu_gtt_micro: dequant arm: %lld GiB registered, alias=%p%s, %d experts x (gu %dx%d + d %dx%d)\n",
+                gib, alias, alias == (void*) host ? " (identity)" : "", kExperts, (int) n_ff, (int) n_embd, (int) n_embd,
+                (int) n_ff);
+    uint16_t* dq_gu = nullptr, *dq_d = nullptr, *d_ping = nullptr;
+    CHECK(hipMalloc(&dq_gu, 1280 * 2560 * 2));
+    CHECK(hipMalloc(&dq_d, 2560 * 640 * 2));
+    CHECK(hipMalloc(&d_ping, 4 << 20));
+    // the engine's prefault: one full DMA read pass (4 MiB chunks) before any kernel touches the region
+    const size_t chunk = 4ull << 20;
+    for (long long off = 0; off < bytes; off += chunk)
+        CHECK(hipMemcpy(d_ping, host + off, (size_t) std::min<long long>(chunk, bytes - off), hipMemcpyHostToDevice));
+    CHECK(hipDeviceSynchronize());
+    std::printf("igpu_gtt_micro: dequant arm: prefault done, running the %d experts\n", kExperts);
+    for (int e = 0; e < kExperts; ++e) {
+        const uint8_t* b = (const uint8_t*) alias + (long long) e * (long long) blob;
+        strata::kernels::iq_dequant_gu_f16(kType, b, b + up_off, n_ff, n_embd, dq_gu, nullptr);
+        strata::kernels::iq_dequant_f16(kType, b + down_off, n_embd * n_ff, dq_d, nullptr);
+        const hipError_t err = hipStreamSynchronize(0);
+        if (err != hipSuccess) {
+            std::fprintf(stderr, "igpu_gtt_micro: dequant arm: expert %d failed: %s (blob at %p)\n", e,
+                         hipGetErrorString(err), (const void*) b);
+            return 1;
+        }
+        if (e % 64 == 63) std::printf("  dequant arm: expert %d ok\n", e);
+    }
+    // spot-check the outputs: the first 64 of each must be finite (the patterned input is not valid Q2_0,
+    // so values are junk - this only proves the writes landed)
+    uint16_t* h = (uint16_t*) std::malloc(2);
+    uint16_t gu0 = 0, d0 = 0;
+    CHECK(hipMemcpy(&gu0, dq_gu, 2, hipMemcpyDeviceToHost));
+    CHECK(hipMemcpy(&d0, dq_d, 2, hipMemcpyDeviceToHost));
+    std::printf("igpu_gtt_micro: dequant arm: all %d experts dequantized (gu[0]=0x%04x d[0]=0x%04x)\n", kExperts,
+                (unsigned) gu0, (unsigned) d0);
+    CHECK(hipFree(dq_gu));
+    CHECK(hipFree(dq_d));
+    CHECK(hipFree(d_ping));
+    (void) hipHostUnregister(host);
+    free(host);
+    free(h);
+    return 0;
+}
+
 
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {

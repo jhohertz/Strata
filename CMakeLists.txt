@@ -431,7 +431,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/igpu_gtt_micro.cpp")
       # igpu-rework P0: host-memory (GTT) read vs device-buffer read vs the H2D copy they replace
       add_executable(igpu_gtt_micro tests/hip/igpu_gtt_micro.cpp)
-      target_link_libraries(igpu_gtt_micro PRIVATE strata_hip_runtime)
+      target_link_libraries(igpu_gtt_micro PRIVATE strata_kernels strata_hip_runtime)
       add_test(NAME igpu_gtt_micro COMMAND igpu_gtt_micro)
       list(APPEND _strata_hip_tests igpu_gtt_micro)
     endif()

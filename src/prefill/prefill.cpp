@@ -1864,6 +1864,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 } else {
                                     mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 }
+                                if (checks_on && !xcheck("after the expert gather")) return false;
                                 if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
@@ -1882,6 +1883,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
                                 m.mmq_ctx->run(gu, m.cs);
                                 mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                                if (checks_on && !xcheck("after the gu product")) return false;
                                 pt.mark(kPfGemmD, cs);
                                 mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
                                 mmq::Product dn;
@@ -1890,27 +1892,59 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
                                 m.mmq_ctx->run(dn, m.cs);
+                                if (checks_on && !xcheck("after the dn product")) return false;
                                 return true;
                             }
                             const int q = (int) (j % DQ);
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
+                                // igpu-rework P1 run 26: the run 25 fault window covered this whole block;
+                                // name each kernel so the next fault names its launch (STRATA_PREFILL_CHECKS).
                                 strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                    m.dq_gu[q], m.cs);
+                                if (checks_on && !xcheck("after dequant gu")) return false;
                                 strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                if (checks_on && !xcheck("after dequant d")) return false;
+                                if (std::getenv("STRATA_TRACE") && l == 0 && j == 0)
+                                    std::fprintf(stderr,
+                                                 "strata trace: compute l=%d e=%d ne=%lld o0=%lld blob=%p dq_gu[q=%d]=%p "
+                                                 "dq_d=%p Xs=%p GU=%p Hh=%p Dm=%p | fmt gu=%d d=%d up_off=%llu "
+                                                 "down_off=%llu n_ff=%lld n_embd=%lld\n",
+                                                 l, e, (long long) m.cnt[(size_t) e], (long long) m.off[(size_t) e],
+                                                 (const void*) blob_dev, q, (void*) m.dq_gu[q], (void*) m.dq_d[q],
+                                                 (const void*) m.Xs, (void*) m.GU, (const void*) m.Hh, (void*) m.Dm,
+                                                 f.gu_type, f.d_type, (unsigned long long) f.up_off,
+                                                 (unsigned long long) f.down_off, (long long) f.n_ff, (long long) f.n_embd);
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
+                                if (checks_on && !xcheck("after blob dequant")) return false;
                             }
                             if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             pt.mark(kPfGemmGU, cs);
                             m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                            if (checks_on && !xcheck("after gu gemm")) return false;
                             swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                            if (checks_on && !xcheck("after swiglu")) return false;
                             pt.mark(kPfGemmD, cs);
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            if (checks_on && !xcheck("after dn gemm")) return false;
                             return true;
                         };
+                        // igpu-rework P1 run 25: the dmesg fault is a NULL-base read (GPU VA 0x0-0x6000, 4 KiB
+                        // stride) in this section - report the VRAM left when it first happens (an unchecked
+                        // allocation under the iGPU's 16 GiB budget is the leading candidate for the null).
+                        if (std::getenv("STRATA_TRACE") && use_mmq) {
+                            static bool vr1 = false;
+                            if (!vr1) {
+                                vr1 = true;
+                                size_t vf = 0, vt = 0;
+                                if (cudaMemGetInfo(&vf, &vt) == cudaSuccess)
+                                    std::fprintf(stderr, "strata trace: VRAM at first expert section: %.1f / %.1f MiB free\n",
+                                                 (double) vf / 1048576.0, (double) vt / 1048576.0);
+                            }
+                        }
                         if (!stream_all) {
                             size_t staged = 0;
                             const size_t lookahead = STAGE - 1;
