@@ -33,6 +33,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/native_ple_postops.hpp"   // igpu-rework P1: the code-object warmup
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -3397,6 +3398,45 @@ int main(int argc, char** argv) {
 
     mem_mark("the expert cache and the graphs");
     std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
+    // igpu-rework P1 run 21: the PLE postops TU (native_ple_postops.cu) code object is loaded LAZILY on the
+    // first launch of any of its kernels, and that first launch is the prompt's layer-1 PLE block in every
+    // run (the per-token variant only runs in the decode token loop, which starts after the prompt).  On this
+    // APU a module load that lands mid-prompt deadlocks its code-object blit against the KFD fault handlers
+    // (the backtrace: hipLaunchKernel -> native_ple_postops_batch -> hsa_executable_freeze ->
+    // BlitKernel::SubmitLinearCopyCommand).  One per-token launch here - at init, calm state, finite zero
+    // inputs - loads the code object before the prompt, so the layer-1 launch is an ordinary launch.  The
+    // per-token variant is read-only in the PLE history (the batch variant advances it), so nothing is
+    // corrupted.  Alias mode only: the copy path has always completed this same first launch fine.
+    if (xcache.aliases() && ss.ple.ready()) {
+        const int64_t HD = strata::kernels::NG_HC_DIM;
+        const int64_t N = g.n_embd;
+        float* tmp = nullptr;
+        if (cudaMalloc(&tmp, (size_t) (8 * HD + N + 4) * sizeof(float)) == cudaSuccess) {
+            (void) cudaMemset(tmp, 0, (size_t) (8 * HD + N + 4) * sizeof(float));
+            float* p = tmp;
+            auto take = [&](int64_t c) { float* r = p; p += c; return r; };
+            float* pk = take(HD);
+            float* hid = take(HD);
+            float* val = take(N);
+            strata::kernels::NativePlePostopsBuffers bufs;
+            bufs.key = take(HD);
+            bufs.query = take(HD);
+            bufs.gate = take(4);
+            bufs.gated = take(HD);
+            bufs.normalized = take(HD);
+            bufs.conv = take(HD);
+            bufs.result = take(HD);
+            strata::kernels::native_ple_postops(pk, hid, val, ss.ple.hist, ss.ple.w, bufs, (void*) 0);
+            (void) cudaDeviceSynchronize();
+            (void) cudaFree(tmp);
+            std::fprintf(stderr, "strata generate: the PLE postops code object is loaded (one dummy per-token launch)\n");
+        } else {
+            (void) cudaGetLastError();
+            std::fprintf(stderr,
+                         "strata generate: WARNING: the PLE warmup allocation failed; the code object still "
+                         "loads at the prompt's first PLE launch\n");
+        }
+    }
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
             return strata::core::lm_head(wt, g, ss.block, d_logits, stream, err);

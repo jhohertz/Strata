@@ -683,3 +683,31 @@ bt 40` (through the libamdhip64 frames to the engine-side caller, so
 the module load's identity is known - hipModuleLoadData = a
 BLAS JIT cubin vs. a static kernel TU) plus `info proc mappings` (to
 symbolize the library frames offline).
+
+**Run 21 (2026-10-03 20:06, boot of 19:22): the 4 MiB prefault
+fixed the VRAM exhaustion - and the layer-1 hang is back, with the
+identity of the module load finally in hand.**
+- Prefault: clean, ~1 s.  No "do not fit" - the prompt's buffers fit
+  again.
+- Same hang at "prompt layer 1".  The deep backtrace
+  (`thread apply 1 bt 40`) finally reaches the engine:
+  `#16 hipLaunchKernel -> #17 strata::kernels::native_ple_postops_batch
+  -> #18 strata::prefill::Prefill::run -> #19 main`, under
+  `hsa_executable_freeze -> BlitKernel::SubmitLinearCopyCommand`.
+
+  **The module load is the lazy load of native_ple_postops.cu's code
+  object, and its first launch is the prompt's layer-1 PLE block in
+  every run** (the per-token variant only runs in the decode token
+  loop, which starts after the prompt; the verify graph does not
+  capture it).  The hipBLASLt warmup (run 19) and the PLE-table/GEMM
+  work are all exonerated - this one launch is the deadlock trigger on
+  this APU.
+
+**Fix (run 21, in the tree):** one dummy launch of the PER-TOKEN
+variant `native_ple_postops` (same TU, same code object) at init -
+after "session is up", alias mode only, finite zero inputs, 342 KiB of
+temporary device memory, followed by a device sync.  The per-token
+variant is read-only in the PLE history (the batch variant advances
+it), so the prompt starts with exactly the same state as before.  The
+layer-1 launch is then an ordinary launch of an already-loaded code
+object.
