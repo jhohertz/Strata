@@ -3411,7 +3411,9 @@ int main(int argc, char** argv) {
         const int64_t HD = strata::kernels::NG_HC_DIM;
         const int64_t N = g.n_embd;
         float* tmp = nullptr;
-        if (cudaMalloc(&tmp, (size_t) (8 * HD + N + 4) * sizeof(float)) == cudaSuccess) {
+        cudaStream_t wstream = nullptr;
+        if (cudaMalloc(&tmp, (size_t) (8 * HD + N + 4) * sizeof(float)) == cudaSuccess &&
+            cudaStreamCreate(&wstream) == cudaSuccess) {
             (void) cudaMemset(tmp, 0, (size_t) (8 * HD + N + 4) * sizeof(float));
             float* p = tmp;
             auto take = [&](int64_t c) { float* r = p; p += c; return r; };
@@ -3426,12 +3428,15 @@ int main(int argc, char** argv) {
             bufs.normalized = take(HD);
             bufs.conv = take(HD);
             bufs.result = take(HD);
-            strata::kernels::native_ple_postops(pk, hid, val, ss.ple.hist, ss.ple.w, bufs, (void*) 0);
-            (void) cudaDeviceSynchronize();
+            strata::kernels::native_ple_postops(pk, hid, val, ss.ple.hist, ss.ple.w, bufs, (void*) wstream);
+            (void) cudaStreamSynchronize(wstream);   // the load is what matters: done before the prompt starts
+            (void) cudaStreamDestroy(wstream);
             (void) cudaFree(tmp);
             std::fprintf(stderr, "strata generate: the PLE postops code object is loaded (one dummy per-token launch)\n");
         } else {
             (void) cudaGetLastError();
+            if (wstream) (void) cudaStreamDestroy(wstream);
+            if (tmp) (void) cudaFree(tmp);
             std::fprintf(stderr,
                          "strata generate: WARNING: the PLE warmup allocation failed; the code object still "
                          "loads at the prompt's first PLE launch\n");

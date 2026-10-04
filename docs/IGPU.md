@@ -711,3 +711,17 @@ variant is read-only in the PLE history (the batch variant advances
 it), so the prompt starts with exactly the same state as before.  The
 layer-1 launch is then an ordinary launch of an already-loaded code
 object.
+
+**Run 22 (2026-10-03 21:17, boot of 21:04): the "hang" was my own
+warmup - a null-stream throw.**
+- Prefault clean (1083 ms), "session is up" printed, then the process
+  sat in `std::terminate -> abort` (caught mid-teardown by the
+  forensics SIGSTOP): `__cxa_throw` out of
+  `strata::kernels::native_ple_postops` - the first line of that
+  function is `if (!stream) throw std::invalid_argument(...)`, and the
+  dummy launch had passed stream 0.  The throw happened before any
+  kernel launch, so the code object never loaded and this run says
+  nothing about the init-time load hypothesis.
+
+  Fix: the warmup creates a temporary stream, launches on it,
+  stream-syncs (the load is what matters), destroys it.
