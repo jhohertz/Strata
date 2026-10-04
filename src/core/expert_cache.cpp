@@ -321,6 +321,12 @@ bool ExpertCache::set_aliased_pointers(const uint64_t* host_pointers, std::strin
             return false;
         }
     }
+    // igpu-rework P1 run 29: the batch path had verified the DEVICE table and then left the HOST
+    // mirror (h_ptrs_) at its open_aliased zeros - while device_slot(), the prompt path's lookup,
+    // reads h_ptrs_.  Every device_slot() in alias mode returned NULL: the dequant's NULL-base IMA
+    // (dmesg 0x0-0x6000, the gate region read from base 0) and the whole run 23-28 chain.  The
+    // per-slot fill_slot updates both tables; the batch fill must too.
+    h_ptrs_.assign(host_pointers, host_pointers + n);
     fills_ = (int64_t) n;
     return true;
 }
