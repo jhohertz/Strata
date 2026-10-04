@@ -1917,21 +1917,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 const auto& f = lay.fmt[(size_t) l];
                                 // igpu-rework P1 run 26: the run 25 fault window covered this whole block;
                                 // name each kernel so the next fault names its launch (STRATA_PREFILL_CHECKS).
+                                // run 28: the dump is BEFORE the launch - run 26's was after the fault point
+                                // (the check that fails is right after this kernel) and never printed.
+                                if (std::getenv("STRATA_TRACE") && l == 0 && j == 0)
+                                    std::fprintf(stderr,
+                                                 "strata trace: compute l=%d e=%d ne=%lld o0=%lld blob=%p blob+up=%p "
+                                                 "dq_gu[q=%d]=%p dq_d=%p Xs=%p GU=%p Hh=%p Dm=%p | fmt gu=%d d=%d "
+                                                 "up_off=%llu down_off=%llu n_ff=%lld n_embd=%lld host_res=%d\n",
+                                                 l, e, (long long) m.cnt[(size_t) e], (long long) m.off[(size_t) e],
+                                                 (const void*) blob_dev, (const void*) (blob_dev + f.up_off), q,
+                                                 (void*) m.dq_gu[q], (void*) m.dq_d[q], (const void*) m.Xs,
+                                                 (void*) m.GU, (void*) m.Hh, (void*) m.Dm, f.gu_type, f.d_type,
+                                                 (unsigned long long) f.up_off, (unsigned long long) f.down_off,
+                                                 (long long) f.n_ff, (long long) f.n_embd,
+                                                 m.host_res ? m.host_res[(size_t) l * m.g->n_expert + e] : -1);
                                 strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                    m.dq_gu[q], m.cs);
                                 if (checks_on && !xcheck("after dequant gu")) return false;
                                 strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
                                 if (checks_on && !xcheck("after dequant d")) return false;
-                                if (std::getenv("STRATA_TRACE") && l == 0 && j == 0)
-                                    std::fprintf(stderr,
-                                                 "strata trace: compute l=%d e=%d ne=%lld o0=%lld blob=%p dq_gu[q=%d]=%p "
-                                                 "dq_d=%p Xs=%p GU=%p Hh=%p Dm=%p | fmt gu=%d d=%d up_off=%llu "
-                                                 "down_off=%llu n_ff=%lld n_embd=%lld\n",
-                                                 l, e, (long long) m.cnt[(size_t) e], (long long) m.off[(size_t) e],
-                                                 (const void*) blob_dev, q, (void*) m.dq_gu[q], (void*) m.dq_d[q],
-                                                 (const void*) m.Xs, (void*) m.GU, (const void*) m.Hh, (void*) m.Dm,
-                                                 f.gu_type, f.d_type, (unsigned long long) f.up_off,
-                                                 (unsigned long long) f.down_off, (long long) f.n_ff, (long long) f.n_embd);
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                                 if (checks_on && !xcheck("after blob dequant")) return false;
