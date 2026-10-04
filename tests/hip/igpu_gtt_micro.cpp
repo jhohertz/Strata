@@ -628,7 +628,7 @@ __global__ void micro_copy16_kernel(const uint4* __restrict__ a, int64_t na, con
     else if (i < na + nb + nc) c_dst[i - na - nb] = c[i - na - nb];
 }
 
-int run_gather_arm(long long gib, bool pinned, bool nb) {
+int run_gather_arm(long long gib, bool pinned, bool nb, long long pressure_gib) {
     constexpr int kExperts = 512;
     constexpr size_t half = 460800, blob = 1382400;   // gate | up | down, Q2_0 640x2560 / 2560x640
     const long long bytes = gib * (1ll << 30);
@@ -661,6 +661,18 @@ int run_gather_arm(long long gib, bool pinned, bool nb) {
     CHECK(hipMalloc(&d_d, half * kExperts));
     uint8_t* d_flat = nullptr; // one full blob per expert: the flat copy's destination
     CHECK(hipMalloc(&d_flat, blob * kExperts));
+    // the engine's VRAM state: ~8 GiB of session scratch held while the experts run (16 GiB budget)
+    void* pressure = nullptr;
+    if (pressure_gib > 0) {
+        const long long pb = pressure_gib * (1ll << 30);
+        if (hipMalloc(&pressure, (size_t) pb) != hipSuccess) {
+            std::fprintf(stderr, "igpu_gtt_micro: gather arm: cannot hold %lld GiB: %s\n", pressure_gib,
+                         hipGetErrorString(hipGetLastError()));
+            return 2;
+        }
+        std::printf("igpu_gtt_micro: gather arm: holding %lld GiB of device memory (engine-like VRAM pressure)\n",
+                    pressure_gib);
+    }
     hipStream_t s = 0;
     if (nb) CHECK(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
     // the engine's prefault: one full DMA read pass over the expert region
@@ -701,6 +713,7 @@ int run_gather_arm(long long gib, bool pinned, bool nb) {
     CHECK(hipFree(d_gu));
     CHECK(hipFree(d_d));
     CHECK(hipFree(d_flat));
+    if (pressure) CHECK(hipFree(pressure));
     if (nb) (void) hipStreamDestroy(s);
     if (pinned) (void) hipFreeHost(host);
     else {
@@ -749,11 +762,13 @@ int main(int argc, char** argv) {
         }
         if (std::strcmp(argv[i], "--gather") == 0 && i + 1 < argc) {
             bool pinned = true, nb = false;   // pinned = the engine's complement mapping
+            long long pressure = 0;
             for (int j = i + 2; j < argc; ++j) {
                 if (std::strcmp(argv[j], "reg") == 0) pinned = false;
                 else if (std::strcmp(argv[j], "nb") == 0) nb = true;
+                else if (argv[j][0] >= '0' && argv[j][0] <= '9') pressure = (long long) std::atof(argv[j]);
             }
-            return run_gather_arm((long long) std::atof(argv[i + 1]), pinned, nb);
+            return run_gather_arm((long long) std::atof(argv[i + 1]), pinned, nb, pressure);
         }
     }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;

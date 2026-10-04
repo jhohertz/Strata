@@ -1077,15 +1077,58 @@ this engine's workload does not reset with a simple reboot, or the 0.1.36
 prompt path trips a driver state the 0.1.29 path never enters.  Unresolved;
 needs a longer clean period and the A/B below, not more same-day runs.
 
-### Queued (after a full reboot, ideally one idle period): `p2_boot_run4.sh`
+### The kernel-level signature: userptr restore storm + MES queue hang (2026-10-04 evening)
 
-Gate, then longfill alias with `STRATA_HOSTLOOP=1` (the instrumentation now
-compiles) + `STRATA_PREFILL_TIMING=1`.  If the health run faults again, stop
-and A/B `STRATA_HIPBLASLT_WARMUP=0` (the fault has now touched the warmup
-window twice) before spending another boot.  The answer wanted: host ~ wall
-(launch-bound: batch launches, remove the per-layer ids D2H + full-stream
-sync) or gpu ~ wall with small host (the kernels are genuinely ~5 ms/expert:
-a different expert kernel shape).
+The journal (which survives reboots) gives the fault its real shape.  Both
+the first fault (04:24, boot -4) and a later one (18:24, current boot):
+
+```
+amdgpu_amdkfd_restore_userptr_worker hogged CPU for >10000us N times   # N grows: 4..7..19..35
+MES failed to respond to msg=REMOVE_QUEUE
+MES might be in unrecoverable state, issue a GPU reset  ->  MODE2 reset succeeded
+```
+
+The KFD **userptr restore worker** (userptr = the registered-host-pointer
+mapping, exactly the alias complement's mechanism) runs in >10 ms passes that
+**never finish** in faulting runs, and the **MES** (the GPU's microengine
+scheduler) then hangs removing a hardware queue (doorbell 0x1004) until the
+driver does a MODE2 reset.  A *clean* 0.1.36 alias run (P2.2, 03:59) shows
+the same restore worker, but it settles after 4-5 passes - the difference is
+that in faulting runs the restore loop does not terminate.
+
+Exonerated on the evening of 10-04 (all on the faulting machine):
+
+| suspect | test | result |
+|---|---|---|
+| 31 GiB userptr range alone | micro `--gather 31` | PASS 32.2 GB/s |
+| + 8 GiB VRAM session pressure | micro `--gather 31 8` | PASS 30.8 GB/s |
+| SSD keepalive file churn during the prompt | engine + `STRATA_SSD_KEEPALIVE=0` | FAULT |
+| reboot / 46 min idle | boot D, first run | FAULT |
+| kernel/driver/firmware change | cmdline, dpkg, fwupd history | none in the window |
+
+The 10/10-clean -> 0/5-fault transition happened **within one boot**, between
+03:59 and 04:24 (boot -4), with 0.1.29 and 0.1.36 alias runs interleaved and
+clean on both sides; it has since persisted across three reboots.  No
+software artifact in the repo changed in that window.  The remaining suspects
+are machine state that survives a reboot (a power rail / VRM / thermal
+marginality on the APU package - the iGPU shares the die with the CPU - or
+GPU firmware state if the reboots were not full power cycles).  The two
+2-3 minute boots at 14:09/14:21 (the user was at the machine) did not change
+the outcome either way.
+
+### Queued (needs a FULL power cycle - hold the power button / unplug the PSU -
+plus a long idle, and the next attempt logs thermals): `p2_boot_run6.sh`
+
+Gate, then a 1 Hz `rocm-smi` temp/power logger in the background, then
+longfill alias with `STRATA_HOSTLOOP=1` + `STRATA_PREFILL_TIMING=1`
+(instrumentation now compiles) + `STRATA_SSD_KEEPALIVE=0` (exonerated but
+harmless).  The thermal log answers the one remaining question the software
+can ask: does the package approach its thermal/power limit in the faulting
+window?  If the run faults with clean thermals, the evidence is for a
+driver/firmware-level userptr path problem (record it as such, with the
+journal excerpts) rather than a hardware one.  If it passes, the machine has
+recovered and the host/GPU separation (P2's original goal) proceeds as
+planned.
 
 ### Reboot log (the long tail)
 
