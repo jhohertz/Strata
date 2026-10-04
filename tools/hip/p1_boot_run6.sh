@@ -25,7 +25,7 @@ echo "(micro rc=$RC; a fault here degrades the APU, but it answers the mechanism
 
 echo "== 3) engine alias arithmetic, STRATA_GROUP_COPY=1  $(date +%H:%M:%S)"
 IDS=$(python3 -c "import json;print(json.load(open('/tmp/p0-out/smoke_ids.json'))['arithmetic'])")
-env STRATA_IGPU_ALIAS=1 STRATA_TRACE=1 STRATA_GROUP_COPY=1 STRATA_HIPBLASLT_WARMUP=1 \
+env STRATA_IGPU_ALIAS=1 STRATA_TRACE=1 STRATA_GROUP_COPY=1 STRATA_PREFILL_CHECKS=1 STRATA_HIPBLASLT_WARMUP=1 \
     STRATA_HIPBLASLT_TUNING="$PWD/tools/hip/gfx1103-hipblaslt-100401.txt" \
   timeout 900 ./build-hip/strata "${ARGS[@]}" --tokens "$IDS" > /tmp/p1-out/gc1.out 2> /tmp/p1-out/gc1.err
 RC=$?
@@ -36,7 +36,7 @@ if [ $RC -eq 0 ]; then
   echo "== 4) python, marker, longfill (same boot)  $(date +%H:%M:%S)"
   for CASE in python marker longfill; do
     IDS=$(python3 -c "import json;print(json.load(open('/tmp/p0-out/smoke_ids.json'))['$CASE'])")
-    env STRATA_IGPU_ALIAS=1 STRATA_GROUP_COPY=1 STRATA_HIPBLASLT_WARMUP=1 \
+    env STRATA_IGPU_ALIAS=1 STRATA_GROUP_COPY=1 STRATA_PREFILL_CHECKS=1 STRATA_HIPBLASLT_WARMUP=1 \
         STRATA_HIPBLASLT_TUNING="$PWD/tools/hip/gfx1103-hipblaslt-100401.txt" \
       timeout 900 ./build-hip/strata "${ARGS[@]}" --tokens "$IDS" > /tmp/p1-out/$CASE.out 2> /tmp/p1-out/$CASE.err
     RC2=$?

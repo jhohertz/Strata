@@ -756,3 +756,25 @@ deadlock is FIXED; a new IMA surfaces in the expert section.**
   --alias (kernel read through the device alias of a pinned region).
   Boot protocol 6: gate, --alias 8, engine alias arithmetic with
   STRATA_GROUP_COPY=1 (chaining the smoke on a pass).
+
+**Run 24 (2026-10-03 22:26, boot of 22:22): the alias is
+innocent; the IMA moved; the hang was an unreported async IMA.**
+- micro `--alias 8`: PASS - `hipHostGetDevicePointer` returns an
+  **identity** pointer on this APU (device-alias == host pointer), and
+  a kernel read through it runs at 54.7 GB/s.  The grp_dev alias
+  mechanism is not a fault source.
+- engine with STRATA_GROUP_COPY=1: the "prefill copy_i32" IMA is gone
+  (those kernels no longer exist in this path), but the run still
+  failed - it HUNG 900 s (the timeout), and the teardown revealed the
+  error state: "illegal memory access".  The last trace is now
+  "layer 1 attn+mlp done, experts begin" - past the point where run
+  23 died.  So: an IMA in the expert section (quantize / bounds /
+  group computes / combine) that no check() caught, leaving the stream
+  dead and the run spinning until the timeout.  (Layer 0's expert
+  section - same kernels, same complement - completed fine.)
+
+  The non-staging expert section now has named, gated error checks
+  (STRATA_PREFILL_CHECKS=1: after mmq quantize / after the bounds
+  upload / after the expert computes / after moe_combine) - an async
+  IMA now reports its section and layer and exits instead of hanging
+  900 s.

@@ -1330,6 +1330,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt layer %lld\n", (long long) l); std::fflush(stderr); }   // igpu-rework P1 hang hunt
+            // igpu-rework P1 run 24: named error checks - an async IMA in the expert section used to sit
+            // unreported (no check) until the stream died silently and the run hung 900 s.  Gated:
+            // STRATA_PREFILL_CHECKS=1 (adds a sync per section; the dGPU path is untouched by default).
+            static const bool checks_on = std::getenv("STRATA_PREFILL_CHECKS") != nullptr;
+            auto xcheck = [&m, &err, l](const char* where) -> bool {
+                if (const cudaError_t e2 = cudaStreamSynchronize(m.cs); e2 != cudaSuccess) {
+                    err = "prefill: layer " + std::to_string(l) + " " + where + ": " + cudaGetErrorString(e2);
+                    std::fprintf(stderr, "prefill: %s\n", err.c_str());
+                    return false;
+                }
+                return true;
+            };
             const core::LayerView v(*m.wt, l);
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
@@ -1762,6 +1774,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
                             mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
+                            if (checks_on && !xcheck("after mmq quantize")) return false;
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                             // reads the group's own quantized H)
                             const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
@@ -1783,6 +1796,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                         }
+                        if (checks_on && !xcheck("after the bounds upload")) return false;
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                         int stage_next = 0;
                         std::vector<int> stage_of(order.size(), -1);
@@ -1946,8 +1960,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             release_to(m.g->n_expert);
                         }
                     }
+                    if (checks_on && !xcheck("after the expert computes")) return false;
                     pt.mark(kPfCombine, cs);
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    if (checks_on && !xcheck("after moe_combine")) return false;
                     if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: layer %lld moe done\n", (long long) l); std::fflush(stderr); }   // igpu-rework P1 hang hunt
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
