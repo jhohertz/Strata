@@ -1396,3 +1396,36 @@ and the fault was **in my new code, not the machine**.  The chunked registration
    next check.
 
 Fixed and re-run on the same boot (the budget was intact: no sustained GPU work had happened).
+
+## P2.9d: the chunked pin does NOT extend the boot budget - the accumulator is per-session, not per-range (16:2x boot, continued)
+
+After the P2.9c fixes, the CHUNK_GIB=8 burn-in ran on the same boot:
+
+| session | what | result |
+|---|---|---|
+| 1 | the crash probe (died at warmup, before any prompt) | no budget spent at first sight |
+| 2 | probe longfill | clean 37.3 tok/s |
+| 3 | burn-in 1 | clean 37.2 |
+| 4 | burn-in 2 | clean 37.4 |
+| 5 | burn-in 3 | **faulted at the first gather (t+54 s)** - same site as the baseline boot |
+
+**Fault on the 5th session - identical to the baseline boot** (probe + 3 clean, fault on the 5th
+session there too; the crash probe's session counted here).  The chunked registration changed the
+range layout 4x and nothing else moved: not the fault site, not the session count, not the speed
+(37.2-37.4 vs 37.3-37.5 baseline - within noise).  **Verdict: the userptr range size is not the
+accumulator.**  The restore-worker storm was a symptom of the bad phase, not its cause.
+
+What the three boots do agree on: **~5 sessions that put sustained load on the userptr+queues
+per power cycle**, independent of registration shape; small sessions (the smokes, and the micro's
+context, which ran dozens per boot fault-free) cost less.  The remaining code-side candidate is
+the KFD queue lifecycle itself (3 queues created/removed per session; a faulting session's removal
+hangs in MES) - `STRATA_IGPU_ONE_QUEUE` (fold m.copy and the blocking prefault memcpy into m.cs:
+3 -> 1 queue) would test it, but it is a deeper change and the budget it buys is uncertain.
+
+**Practical decision: the budget is not a blocker - it is a planning constraint.**  ~4-5 big
+sessions per power cycle with a probe that says (in 60 s) whether the boot is live is enough for
+real development: one probe + a 3-arm A/B per boot, results at 65 s/run once the file cache is
+warm.  The fault itself is driver territory (the signature, the session tally, and the two
+mitigations tested are all recorded here).  The next boot therefore runs the experiment P2 was
+always about - the launch-cost A/B (`STRATA_MMQ_GROUP` 64/32/16, `p2_boot_run9.sh`, v2 fault-safe
+mechanics) - which fits the budget exactly: probe + 3 arms.
