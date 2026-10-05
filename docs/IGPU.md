@@ -1638,3 +1638,29 @@ last gap (which part of the process state) would need the cost measured inside t
 which the DEGRADED guard and the session budget make expensive; it is parked as the open
 question, with the working characterization: prefill 34-35 tok/s = expert FLOPs at APU rate
 (17.5 s) + gather at ~1/4 micro rate (8.8 s, process-state-bound) + non-expert (7.4 s).
+
+## P2.12c: the fault returns on the 5th session of the 19:05 boot - and the micro's register cycles may be spending the budget
+
+19:05 boot (normal power-off, ErP): canary clean (396), longfill 35.0, micro gather matrix
+(three 31 GiB register -> DMA -> unregister cycles), longfill 34.9, longfill 34.9, then
+**FAULT on the 5th session** at layer 19 of 48: `unspecified launch failure` in the hipblaslt
+gemm, the process hung (left alive, no kill).  Two journal firsts: the driver **attempted queue
+eviction at the fault** and failed (`amdgpu: Failed to evict queue 3`,
+`remove_all_kfd_queues_mes: Failed to remove queue 2`) - the first time the journal has caught
+the eviction attempt itself rather than its aftermath - and zero
+`restore_userptr_worker` lines again for the whole boot.  tok/s was flat to the fault
+(35.0 / 34.9 / 34.9): no visible ramp in wall time.
+
+The previous boot ran 10 engine sessions clean with no micro between them; this one faulted
+after 4 engine sessions + 3 micro runs, each of which did a 31 GiB `hipHostRegister` ->
+4 MiB-step DMA pass -> `hipHostUnregister` cycle.  The two boots' totals agree with the
+accumulator counting **userptr lifecycle work** (registration, DMA through the mapping,
+unregistration, the driver's internal restore passes) rather than "engine sessions": ~6-7
+session-equivalents either way.  The micro remains perf-safe (its rates do not degrade), but
+it is NOT budget-neutral.  Working rule until proven otherwise: count a 31 GiB micro
+register cycle as roughly one heavy engine session; on a boot meant for N engine runs, keep
+the big micro runs out of the middle.
+
+State after this boot: the machine is faulted with a hung process - **AC-cut power cycle
+(unplug/PSU switch + hold the power button ~10 s), not a normal shutdown** (P2.9e: shutting
+down from a faulted state may carry MES state across the power-off).
