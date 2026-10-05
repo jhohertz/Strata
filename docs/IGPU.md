@@ -1507,3 +1507,51 @@ maintainer note about this exact worker).
 | boot | change | probe | result |
 |---|---|---|---|
 | (fill in) | | | |
+
+## P2.11: the BIOS changeset resolves the fault cluster (17:46 boot) - 10/10 clean, zero restore-worker activity
+
+The user's BIOS pass (IOMMU on everywhere, Global C-states disabled, ErP/S5 deep sleep on,
+UMA 16 -> 8 GiB, ReBAR/Above-4G left on, BIOS already latest, no amdgpu module params yet)
+changed the machine state in ways the journal shows directly:
+
+| machine fact | before | after |
+|---|---|---|
+| VRAM (UMA carve) | 16 GiB | 8 GiB |
+| host RAM the OS sees | 45 GiB | **53 GiB** (the carve comes out of RAM) |
+| usable RAM for the workload | ~29 GiB vs 41.1 GiB of demand (31.64 pinned + ~8 session + 1.5 dense) - **chronic oversubscription** | 45 GiB vs 41.1 GiB - **fits with headroom** |
+| KFD heap accounting | 51.5 GiB of heaps on 45 GiB of RAM | 56 GiB on 53 GiB (the accounting stays virtual, the *pressure* is what moved) |
+| IOMMU | BIOS off + cmdline `iommu=off amd_iommu=on` (contradictory) | `iommu=on amd_iommu=on`, consistent |
+
+The result on this boot: **7 longfill sessions clean (34.2-34.9 tok/s) + 3 smokes
+(arithmetic/python/marker) PASS, and zero `restore_userptr_worker` lines and zero MES lines
+for the whole boot.**  Every earlier boot showed 4-5 restore passes even in *clean* sessions;
+this boot's fault subsystem never ran.  That is a qualitative change, not a longer budget.
+
+The mechanical suspect is the oversubscription: the restore worker exists to walk and restore
+the GTT page tables of the 31.64 GiB userptr; with ~12 GiB more of reclaim pressure on every
+boot, that walk raced itself (settles in 4-5 passes vs runs away at 19+).  The other three
+variables (IOMMU consistency, C-states, ErP) are on the list too but have no mechanism as
+direct.  **Confirmation plan: 2-3 more boots, each with 5+ loaded sessions.  If a future boot
+regresses, bisect in this order: UMA 16 vs 8 (the pressure hypothesis first), then IOMMU,
+then C-states, then ErP** - one variable per boot, probe first, record in the P2.10 table.
+
+### The launch-cost hypothesis dies (same boot)
+
+`STRATA_MMQ_GROUP` 16 / 32 / 64 on the same boot: **34.5 / 34.2 / 34.2 tok/s with identical
+phase profiles** (gemm gu 12.7 s, gather phase 8.8 s, gemm dn 4.7 s).  Collapsing the ~5,200
+product launches 4x moved nothing - launch count is not the wall.  The prefill's ~34 s is:
+the expert FLOPs at APU rate (17.5 s ~ 152 GFLOPS int8 for the fixed FLOPs), the gather phase
+at ~1/5 of the micro's standalone rate (8.8 s for 54.8 GB moved - the one remaining unexplained
+in-engine cost), and the non-expert phases (7.4 s).  The remaining single lever is the gather
+phase itself (batched gather kernel, and the IOMMU-on access path it now runs through).
+
+### The config tradeoff, recorded
+
+IOMMU-on + 8 GiB UMA prefill: 34.2-34.9 tok/s vs the 16 GiB/IOMMU-off boots' 37.5-39.1.
+The ~7% cost buys a fault-free machine (and 8 GiB back for the rest of the box).  For daily
+use the fault-free config wins; both are now characterized so the choice is informed.
+
+Protocol status: the 4-run budget no longer applies (keep the probe + DEGRADED guard as
+standard hygiene until the 2-3 boot confirmation is in, then retire the ritual language from
+the run scripts).  The fault work's deliverable is the diagnosis (this section + P2.6/P2.8-9e)
+and the bisect ladder; the P2 performance work now runs on a machine that holds a boot.
