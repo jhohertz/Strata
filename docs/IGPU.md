@@ -1333,3 +1333,44 @@ The file page cache is not a variable: the complement fill already `madvise(DONT
 `posix_fadvise(DONTNEED)`s each file layer as it copies it (the `fc` micro arm's
 coexistence was therefore not the engine's actual state).  No kernel/firmware updates
 are pending for the 7.0.0-38-generic / ROCm 10.0.0~pre4 stack.
+
+## P2.9b: the baseline budget is confirmed, and the timeout was making things worse (02:29-02:53 boot)
+
+After a full power cycle, `p2_boot_run8.sh` (v1) ran the probe + burn-in:
+
+| run | result | wall |
+|---|---|---|
+| probe | clean 37.5 tok/s | 63 s |
+| 1-3 | clean 37.3-37.5 tok/s | 64-67 s each |
+| 4 | **faulted at the first gather** (`prefill gather_rows16: unspecified launch failure`, t+46 s) | - |
+
+**The 4-run budget is now confirmed twice** (P2.8: 4 clean then the slow phase; this boot: 4 clean
+then an immediate first-gather fault).  The transition to the bad phase lands in ~1 minute
+(between one run's end and the next's first expert section) and is invisible to the micro
+(33.7 GB/s throughout).
+
+**The v1 protocol made the fault worse.**  The faulting run does not exit: it hangs in its
+error path after printing the failure.  v1's `timeout 900` therefore SIGTERM'd the hung
+process 14 minutes 14 seconds after its fault - and the journal's MES REMOVE_QUEUE lines
+landed exactly at the SIGTERM (02:52:51): the KILL, not the fault, drove the teardown's
+queue-removal hang and the MODE2 reset.  A faulted engine process holds its KFD queues
+until it exits; killing it mid-teardown is the worst possible moment.
+
+Two consequences:
+
+1. **v2 never kills** (`p2_boot_run8.sh` rewritten): strata runs in the background and its
+   stderr is watched; a clean run exits on its own (~65 s warm), a fault is recognized in
+   seconds, recorded, and the process is left alive (it dies with the power cycle).  The
+   per-run forensics now count both the restore_userptr_worker lines and the MES lines in
+   the run's window.
+2. **The queue lifecycle is the prime accumulator candidate.**  Every engine run creates
+   and removes ~3 KFD queues (default + m.cs + m.copy); a faulting run's removal is the one
+   that hangs ("Failed to remove queue 0/1/2").  If even clean removals leave residual
+   MES state, the 4-10 run budget is queue-table churn, not GPU work.  Two surface
+   reductions are queued behind the chunk A/B: (a) the chunked userptr (P2.9), (b) one KFD
+   queue in alias mode (fold m.copy and the blocking prefault memcpy into m.cs: 3 -> 1
+   queue per run).
+
+Machine state at the end of this segment: post-fault, post-kill - the next engine run will
+fault immediately; no more engine runs on this boot.  The micro (33.7 GB/s) is not an
+engine-state probe.
