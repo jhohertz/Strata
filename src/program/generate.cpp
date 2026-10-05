@@ -2857,19 +2857,32 @@ int main(int argc, char** argv) {
                                 const uint8_t* cbase = file_src->complement_host();
                                 // 4 MiB target: run 20's 1 GiB target exhausted the iGPU's 16 GiB VRAM budget
                                 // (the H2D pass accounted against it) and the prompt's buffers then "did not fit".
+                                // igpu-rework P2.9: the chunked pin registers N separate ranges, and a DMA that
+                                // spans two of them is refused (invalid argument, 16:2x) - so the pass walks the
+                                // registered ranges, staying inside each.
+                                const auto& ranges = file_src->complement_dma_ranges();
+                                std::vector<std::pair<uint64_t, uint64_t>> one_range;
+                                const std::vector<std::pair<uint64_t, uint64_t>>* pf_ranges = &ranges;
+                                if (ranges.empty()) { one_range.emplace_back(0, cbytes); pf_ranges = &one_range; }
                                 uint8_t* d_ping = nullptr;
                                 const size_t chunk = 4ull << 20;
                                 if (cbase != nullptr && cudaMalloc(&d_ping, chunk) == cudaSuccess) {
                                     const auto pf0 = std::chrono::steady_clock::now();
                                     bool ok = true;
-                                    for (uint64_t off = 0; off < cbytes; off += chunk) {
-                                        const size_t b = (size_t) std::min<uint64_t>(chunk, cbytes - off);
-                                        if (cudaMemcpy(d_ping, cbase + off, b, cudaMemcpyHostToDevice) != cudaSuccess) {
-                                            ok = false;
-                                            break;
+                                    for (const auto& rg : *pf_ranges) {
+                                        for (uint64_t off = rg.first; off < rg.first + rg.second; off += chunk) {
+                                            const size_t b = (size_t) std::min<uint64_t>(chunk, rg.first + rg.second - off);
+                                            if (cudaMemcpy(d_ping, cbase + off, b, cudaMemcpyHostToDevice) != cudaSuccess) {
+                                                ok = false;
+                                                break;
+                                            }
                                         }
+                                        if (!ok) break;
                                     }
                                     (void) cudaDeviceSynchronize();
+                                    // a refused DMA latches into cudaGetLastError and the next kernel's
+                                    // post-launch check would blame its own healthy launch (the 16:2x abort)
+                                    (void) cudaGetLastError();
                                     (void) cudaFree(d_ping);
                                     if (ok)
                                         std::fprintf(stderr, "strata generate: the complement's GTT page tables are "

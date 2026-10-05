@@ -1374,3 +1374,25 @@ Two consequences:
 Machine state at the end of this segment: post-fault, post-kill - the next engine run will
 fault immediately; no more engine runs on this boot.  The micro (33.7 GB/s) is not an
 engine-state probe.
+
+## P2.9c: the chunked pin's first flight (16:2x boot) - two real bugs, caught by the probe
+
+The first CHUNK_GIB=8 probe died at t+27 s with `Aborted (core dumped)` - and the probe-first
+protocol did its job: the machine spent nothing (death before the prompt, clean process exit),
+and the fault was **in my new code, not the machine**.  The chunked registration itself worked
+(`page-locked and mapped in 4 chunked registrations (8 GiB each)`); two bugs followed:
+
+1. **A DMA that spans two registrations is refused.**  The chunk cuts are expert-boundary-aligned
+   (multiples of 1,382,400 B, not 4 MiB-aligned), and the prefault pass copies in 4 MiB pieces
+   from the arena base - so one copy straddled the first registration boundary at ~8.0 GiB and
+   `cudaMemcpy` returned `invalid argument`.  Fix: the chunked pin records its ranges
+   (`complement_dma_ranges()`), and the prefault pass walks them, never crossing a boundary.
+2. **A refused DMA latches into `cudaGetLastError`.**  The prefault warning path did not clear
+   it, so the next post-launch error check - the PLE warmup's GR RMSNorm - blamed a healthy
+   launch, threw, hit a `noexcept` frame, and aborted.  The `terminate ... native GR RMSNorm
+   launch: invalid argument` was the *second* code's crash for the *first* code's error.  Fix:
+   the prefault pass clears the latched error; and this is a general lesson for the engine's
+   check convention - every swallowed API failure must clear the latch or it misattributes the
+   next check.
+
+Fixed and re-run on the same boot (the budget was intact: no sustained GPU work had happened).

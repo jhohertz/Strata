@@ -438,6 +438,9 @@ public:
     uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
     uint64_t resident_bytes() const { return complement_bytes_; }
     const uint8_t* complement_host() const { return complement_host_; }   // igpu-rework P1: the RAM complement's base
+    /// igpu-rework P2.9: the registered ranges [offset, bytes) within the arena when chunked (empty = one
+    /// registration covers the whole arena; a DMA spanning two separate registrations is refused).
+    const std::vector<std::pair<uint64_t, uint64_t>>& complement_dma_ranges() const { return complement_ranges_; }
     bool complement_pinned() const { return complement_pinned_; }
     /// igpu-rework (docs/IGPU.md): the iGPU's KFD/GTT path faults a kernel read of any host VMA the driver
     /// has never seen - measured: unregistered regions fault at every size and for file mappings alike,
@@ -565,6 +568,11 @@ private:
     // igpu-rework P2.9: STRATA_IGPU_PIN_CHUNK_GIB - the arena registered as N chunked userptr ranges; each
     // base unregisters its own chunk (hipHostUnregister takes the pointer only).  Empty = the ordinary path.
     std::vector<void*> complement_chunks_;
+    /// The registered ranges as [offset, bytes) pairs within the arena (the chunked pin).  A runtime DMA
+    /// that spans two separate registrations is refused (invalid argument, measured 2026-10-05 16:2x), so
+    /// anything that memcpys from the arena must stay inside one range.  Empty = one registration covers
+    /// the whole arena.
+    std::vector<std::pair<uint64_t, uint64_t>> complement_ranges_;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)

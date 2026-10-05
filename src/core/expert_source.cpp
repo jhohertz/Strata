@@ -495,6 +495,7 @@ void FileExpertSource::close() {
     complement_partial_ = false;
     complement_pin_limit_ = 0;
     complement_chunks_.clear();
+    complement_ranges_.clear();
     complement_lock_off_ = 0;
     complement_ready_ = false;
     complement_locked_ = 0;
@@ -1163,13 +1164,14 @@ bool FileExpertSource::pin_cache_complement(
         if (arena == nullptr) return;
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
-            if (!complement_chunks_.empty()) {   // igpu-rework P2.9: the chunked registration
+            if (!complement_chunks_.empty()) {   // igpu-rework P2.9: the chunked registration (unregister per chunk)
                 for (void* p : complement_chunks_) (void) cudaHostUnregister(p);
             } else if (partial_pin > 0) (void) cudaHostUnregister(arena);
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
             std::free(arena);
         }
         complement_chunks_.clear();
+        complement_ranges_.clear();
         arena = nullptr;
     };
     if (bytes > 0) {
@@ -1190,6 +1192,7 @@ bool FileExpertSource::pin_cache_complement(
             bool c_all = true;
             int c_n = 0;
             std::vector<void*> c_bases;   // the registered chunk bases (hipHostUnregister takes the pointer only)
+            std::vector<std::pair<uint64_t, uint64_t>> c_ranges;
             while (c_off < bytes) {
                 uint64_t w = std::min<uint64_t>(bytes - c_off, chunk_gib_g << 30);
                 for (size_t i = 0; i < offsets.size(); ++i) {
@@ -1201,6 +1204,7 @@ bool FileExpertSource::pin_cache_complement(
                 if (cudaHostRegister((void*) ((uint8_t*) arena + c_off), (size_t) w, cudaHostRegisterMapped | cudaHostRegisterPortable)
                     != cudaSuccess) { (void) cudaGetLastError(); c_all = false; break; }
                 c_bases.push_back((void*) ((uint8_t*) arena + c_off));
+                c_ranges.emplace_back(c_off, w);
                 c_off += w;
                 ++c_n;
             }
@@ -1216,6 +1220,7 @@ bool FileExpertSource::pin_cache_complement(
                     partial_pin = bytes;   // fully page-locked, but by N registrations: released as partial
                     pinned_ok = false;
                     complement_chunks_ = std::move(c_bases);
+                    complement_ranges_ = std::move(c_ranges);   // DMAs must stay inside one range
                     note = "page-locked and mapped in " + std::to_string(c_n) + " chunked registrations (" +
                            std::to_string(chunk_gib_g) + " GiB each)";
                 } else {
