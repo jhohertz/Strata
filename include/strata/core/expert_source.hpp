@@ -562,6 +562,9 @@ private:
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
     uint64_t complement_pin_limit_ = 0;
+    // igpu-rework P2.9: STRATA_IGPU_PIN_CHUNK_GIB - the arena registered as N chunked userptr ranges; each
+    // base unregisters its own chunk (hipHostUnregister takes the pointer only).  Empty = the ordinary path.
+    std::vector<void*> complement_chunks_;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)

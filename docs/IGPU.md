@@ -1261,3 +1261,75 @@ Operating rule updated: after a full power cycle, a boot is good for roughly 4-5
 engine runs before the degraded phase appears; budget experiments accordingly (the
 MMQ_GROUP A/B is exactly that size), and treat any section running >1 s/section as
 "stop now, do not reboot, power cycle" (a reboot does not clear it).
+
+## P2.9: the thermal/idle theory is dead; the strategy changes (2026-10-05 00:3x, degraded boot)
+
+The user (rightly) rejected the "cool it down for hours" protocol.  The evidence agrees:
+P2.8's fault came at **60 C / 65 W, identical to the passing runs**, and the boot 0 run
+(18:24, after a 49-minute idle) faulted anyway.  The idle did nothing; the thermals were
+never at their limit.  `p2_boot_run6/7.sh`'s "long idle" instruction is retracted.
+
+### What the degraded machine says right now (probe, 00:38)
+
+After the 23:13 fault, a fresh longfill probe faulted within ~10 s of the prompt start:
+`prefill: routed id out of range` at layer 0 (the corrupted-ids readback, the 04:2x
+cluster's signature) + `unspecified launch failure` inside the hipBLASLt warmup, then the
+same MES REMOVE_QUEUE hang (queues 0/1/2) + MODE2 reset.  The state machine has degrees:
+
+| degree | behavior | observed |
+|---|---|---|
+| 0 | 0.22 s/section | first 4-10 runs of a post-power-cycle boot |
+| 1 | ~6.7 s/section for minutes, then fault | the 23:13 trace run (71 sections in 8 min) |
+| 2 | immediate fault (corrupted first-layer readback) | the 00:38 probe, after the reset |
+
+**The GPU MODE2 reset does not heal the state - it deepens it** (degree 1 -> 2).  The
+machine state survives warm reboots and is cleared only by a full power cycle, so the
+accumulator lives in GPU firmware (the MES), not RAM.
+
+**The micro runs at 33.7 GB/s on the degraded machine** - identical to healthy.  The
+DRAM/GTT path is never the problem; the degradation is the driver's handling of the
+engine's own surface (queues + the 31.64 GiB userptr under sustained load).  A GPU
+devcoredump now exists at `/sys/class/drm/card1/device/devcoredump/data` (root-only) for
+both the 23:13 and the 00:38 faults.
+
+### Why the userptr must stay, and what changes
+
+The memlock rlimit is 8 MiB (soft = hard): a 31.64 GiB complement cannot be `mlock`ed
+without root, and the no-userptr variant (plain mmap + DMA-prefault, which P0 proved
+kernel-readable) would be a pageable 31.64 GiB with no eviction protection on a 45 GiB
+box.  `cudaHostAllocMapped` (the driver's page lock, no rlimit) or `hipHostRegister`
+chunks are the only no-root page locks.  So the userptr stays; the exposure is reduced
+instead:
+
+- **`STRATA_IGPU_PIN_CHUNK_GIB` (new, expert_source.cpp)**: register the complement as
+  N chunked userptr ranges (e.g. 4 x 8 GiB) instead of one 31.64 GiB range, each cut at
+  an expert boundary.  The fault signature is the per-range restore worker
+  (`amdgpu_amdkfd_restore_userptr_worker hogged CPU >10000us N times`; clean runs settle
+  in 4-5 passes, faulting runs run 35+ and never terminate) - a quarter-sized range makes
+  each pass a quarter of the work.  Fallback: if any chunk is refused, the arena is
+  unmapped and the single-registration path runs (byte-identical to before).  Release
+  unregisters each chunk by its own base.  Default off; dGPU untouched.
+- **Live degradation guard (prefill.cpp, STRATA_HOSTLOOP=1)**: a section > 2 s of host
+  wall after the first five prints one `DEGRADED` line (healthy ~0.2 s; degraded ~7 s,
+  P2.8).  The run's result is flagged non-comparable instead of silently entering the
+  numbers.
+
+### The new protocol: probe, then burn in (`p2_boot_run8.sh`)
+
+No idling, no guessing:
+
+1. **Probe** - one longfill decides the machine's state in ~3 minutes.  Not clean ->
+   capture the journal and stop (the reset is a power cycle, and only then).
+2. **Burn in** - repeat longfills (60 s apart) and count the clean runs until the
+   DEGRADED warning, a fault, or MAX_RUNS.  The count is the boot's run budget for the
+   configuration.  Each run also captures the restore_worker's journal line count (the
+   fault's leading indicator).
+3. **A/B** - baseline boot (single registration, expected 4-5 clean runs, P2.8) vs a
+   chunked boot (`CHUNK_GIB=8`).  If the chunked boot outlasts it (10+), the boot ritual
+   is gone: a machine lasts a day of experiments per power cycle.  If not, the next
+   variable is the chunk size, then the queue count (fold m.copy into m.cs in alias mode).
+
+The file page cache is not a variable: the complement fill already `madvise(DONTNEED)` +
+`posix_fadvise(DONTNEED)`s each file layer as it copies it (the `fc` micro arm's
+coexistence was therefore not the engine's actual state).  No kernel/firmware updates
+are pending for the 7.0.0-38-generic / ROCm 10.0.0~pre4 stack.

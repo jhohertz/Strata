@@ -335,6 +335,7 @@ struct Prefill::Impl {
     // small host: the kernels are slow.  (debug only; dGPU path untouched - nothing prints without the env)
     struct HostLoopSample { double host_ms; cudaEvent_t a; cudaEvent_t b; };
     std::vector<HostLoopSample> hostloop;
+    bool hostloop_degraded = false;   // igpu-rework P2.9: the live slow-phase warning fired
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -2045,7 +2046,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                         if (hl_on) {
                             cudaEventRecord(hl_b, m.cs);
-                            m.hostloop.push_back({ms_since(hl_t0), hl_a, hl_b});
+                            const double hl_ms = ms_since(hl_t0);
+                            m.hostloop.push_back({hl_ms, hl_a, hl_b});
+                            // igpu-rework P2.9: live degradation guard - a healthy section is ~0.2 s of host
+                            // wall (the first section is ~1.6 s of warmup: skip the first five), a degraded
+                            // machine takes ~7 s per section (docs/IGPU.md P2.8).  Warn once; the run's
+                            // numbers are not comparable and the next run in this boot will fault.
+                            if (m.hostloop.size() > 5 && hl_ms > 2000.0 && !m.hostloop_degraded) {
+                                m.hostloop_degraded = true;
+                                std::fprintf(stderr,
+                                             "strata prefill hostloop: DEGRADED section (host wall %.0f ms, "
+                                             "healthy ~220 ms) - the machine's slow phase has started; this run's "
+                                             "result is not comparable, and the next run in this boot will fault "
+                                             "(docs/IGPU.md P2.8)\n", hl_ms);
+                                std::fflush(stderr);
+                            }
                         }
                     }
                     if (checks_on && !xcheck("after the expert computes")) return false;

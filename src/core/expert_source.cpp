@@ -458,8 +458,14 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 
 void FileExpertSource::close() {
     if (complement_arena_ != nullptr) {
-        if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
-        else {
+        // igpu-rework P2.9: the chunked registration is released chunk by chunk (hipHostUnregister takes the
+        // pointer only, and each chunk is its own userptr range)
+        if (!complement_chunks_.empty()) {
+            for (void* p : complement_chunks_) (void) cudaHostUnregister(p);
+            std::free(complement_arena_);
+        } else if (complement_pinned_ && !complement_partial_) {
+            (void) cudaFreeHost(complement_arena_);
+        } else {
             if (complement_partial_) (void) cudaHostUnregister(complement_arena_);
             if (gpu_register_bytes_ > 0)
                 (void) cudaHostUnregister((uint8_t*) complement_arena_ + gpu_register_off_);
@@ -488,6 +494,7 @@ void FileExpertSource::close() {
     complement_pinned_ = false;
     complement_partial_ = false;
     complement_pin_limit_ = 0;
+    complement_chunks_.clear();
     complement_lock_off_ = 0;
     complement_ready_ = false;
     complement_locked_ = 0;
@@ -1146,21 +1153,91 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
+    // igpu-rework P2.9: STRATA_IGPU_PIN_CHUNK_GIB (GiB): register the complement as chunked userptr
+    // ranges instead of one (see the branch below).  0 = the single cudaHostAlloc registration (default).
+    static const uint64_t chunk_gib_g = [] {
+        const char* v = std::getenv("STRATA_IGPU_PIN_CHUNK_GIB");
+        return v && std::atof(v) > 0 ? (uint64_t) std::atof(v) : 0;
+    }();
     auto release = [&]() {
         if (arena == nullptr) return;
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
-            if (partial_pin > 0) (void) cudaHostUnregister(arena);
+            if (!complement_chunks_.empty()) {   // igpu-rework P2.9: the chunked registration
+                for (void* p : complement_chunks_) (void) cudaHostUnregister(p);
+            } else if (partial_pin > 0) (void) cudaHostUnregister(arena);
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
             std::free(arena);
         }
+        complement_chunks_.clear();
         arena = nullptr;
     };
     if (bytes > 0) {
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         std::fflush(stderr);
-        if (pin) {
+        if (pin && chunk_gib_g > 0) {
+            // igpu-rework P2.9: register the arena as N chunked userptr ranges instead of one.  The
+            // driver's userptr restore worker operates per range (amdgpu_amdkfd_restore_userptr_worker
+            // in the fault journals, docs/IGPU.md P2.6/P2.8); one 31.64 GiB range is the biggest single
+            // restore unit the machine carries, and it is the subsystem named in every fault.  Each
+            // chunk is cut at an expert boundary so a blob never straddles two registrations (the same
+            // rule the partial pin uses).  P0 measured chunked hipHostRegister regions kernel-readable
+            // (the --reg arms); the DMA prefault pass still installs the GTT entries afterwards.
+            arena = std::malloc((size_t) bytes);
+            if (arena == nullptr) { err = "FileExpertSource: chunked complement allocation failed"; return false; }
+            uint64_t c_off = 0;
+            bool c_all = true;
+            int c_n = 0;
+            std::vector<void*> c_bases;   // the registered chunk bases (hipHostUnregister takes the pointer only)
+            while (c_off < bytes) {
+                uint64_t w = std::min<uint64_t>(bytes - c_off, chunk_gib_g << 30);
+                for (size_t i = 0; i < offsets.size(); ++i) {
+                    if (offsets[i] == kNoComplement) continue;
+                    const uint64_t b = layer_blob_bytes_[i / (size_t) n_expert_];
+                    if (offsets[i] >= c_off && offsets[i] < c_off + w && offsets[i] + b > c_off + w) { w = offsets[i] - c_off; break; }
+                }
+                if (w == 0) { c_all = false; break; }
+                if (cudaHostRegister((void*) ((uint8_t*) arena + c_off), (size_t) w, cudaHostRegisterMapped | cudaHostRegisterPortable)
+                    != cudaSuccess) { (void) cudaGetLastError(); c_all = false; break; }
+                c_bases.push_back((void*) ((uint8_t*) arena + c_off));
+                c_off += w;
+                ++c_n;
+            }
+            auto c_unmap = [&]() {
+                for (auto it = c_bases.rbegin(); it != c_bases.rend(); ++it) (void) cudaHostUnregister(*it);
+                c_bases.clear();
+            };
+            if (c_all && c_off == bytes) {
+                void* alias = nullptr;
+                const cudaError_t aliased = cudaHostGetDevicePointer(&alias, arena, 0);
+                if (aliased == cudaSuccess && alias != nullptr) {
+                    device = (const uint8_t*) alias;
+                    partial_pin = bytes;   // fully page-locked, but by N registrations: released as partial
+                    pinned_ok = false;
+                    complement_chunks_ = std::move(c_bases);
+                    note = "page-locked and mapped in " + std::to_string(c_n) + " chunked registrations (" +
+                           std::to_string(chunk_gib_g) + " GiB each)";
+                } else {
+                    note = std::string("chunked pin: no device alias (") + cudaGetErrorString(aliased) +
+                           "); falling back to the single registration";
+                    (void) cudaGetLastError();
+                    c_unmap();
+                    partial_pin = 0;
+                    std::free(arena);
+                    arena = nullptr;   // fall through to the single cudaHostAlloc registration
+                }
+            } else {
+                note = std::string("chunked pin: registration stopped at ") +
+                       std::to_string((double) c_off / 1073741824.0) + " GiB of " +
+                       std::to_string((double) bytes / 1073741824.0) + "; falling back to the single registration";
+                c_unmap();
+                partial_pin = 0;
+                std::free(arena);
+                arena = nullptr;   // fall through to the single cudaHostAlloc registration
+            }
+        }
+        if (pin && arena == nullptr) {
             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                          cudaHostAllocMapped | cudaHostAllocPortable);
             if (allocated == cudaSuccess) {
