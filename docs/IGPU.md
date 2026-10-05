@@ -1429,3 +1429,43 @@ warm.  The fault itself is driver territory (the signature, the session tally, a
 mitigations tested are all recorded here).  The next boot therefore runs the experiment P2 was
 always about - the launch-cost A/B (`STRATA_MMQ_GROUP` 64/32/16, `p2_boot_run9.sh`, v2 fault-safe
 mechanics) - which fits the budget exactly: probe + 3 arms.
+
+## P2.9e: a full power-off did NOT clear the state this time (17:06 boot) - shutdown-while-hung is the suspect
+
+The 16:2x chunk boot ended with a faulted session, a failed queue eviction, and the faulted
+process still hung (spinning) when the user shut the machine down at 16:44.  After ~22 minutes
+fully off (journal: boot -1 ends 16:44:37, boot 0 starts 17:06:22), the fresh boot's FIRST
+engine session faulted:
+
+| session | t+ | signature |
+|---|---|---|
+| probe (run9, 17:08) | 54 s | restore storm (4->5->7->11->19 passes) at **17:08:57 - ~17 s in, during the complement build/prefault, not the prompt** - then `routed id out of range` at layer 0 + BLASLt launch failure; teardown: `Failed to evict queue 3`, `Failed to evict process queues`, `Failed to quiesce KFD`, MODE2 reset (succeeded) |
+| probe retry (17:14) | - | `illegal memory access` - faulted, process hung |
+
+With two hung processes holding queues the MES refused to evict, this boot is done; engine work
+stops.  Three refinements:
+
+1. **The storm clock**: on a cold-file first session the restore worker is doing its heaviest work
+   during the build+prefault phase - that is where the storm starts (the earlier "storm during the
+   prompt" reading was from warm-file sessions, where the build is fast and the storm lands in the
+   prompt).  The storm is the registration/first-touch path losing a race with page-table work;
+   settling in 4-5 passes vs blowing past 19 is a race outcome, not (only) a wear counter.
+2. **`unrecoverable state` now has a mechanism-level description**: the MES refuses to evict the
+   queues of a faulted process; the hung process keeps them; and - new this boot - **a shutdown
+   performed while a process is in that state is a candidate for carrying the bad MES state
+   across a power-off** (the driver's shutdown/suspend path touches the same queue machinery the
+   fault just broke).  The earlier "power cycle fixed it" boots had also ended with hung/faulted
+   processes, so the data is thin - but the "power cycle always fixes it" rule just took its first
+   clear counterexample, and shutdown-from-faulted-state is the variable that changed.
+3. **Engine behavior note**: the faulted process does not exit - it spins in the error path
+   (STAT=R) forever.  A self-terminating fault path (hard exit after printing, no spin) would both
+   stop the CPU burn and make "did the boot end dirty" unambiguous.  A usability fix, not a fault
+   fix; queued low.
+
+Operating rule updated: **if a session has faulted this boot, never shut down to "reset" - cut
+AC (unplug / PSU switch, hold the power button ~10 s to discharge) and wait before the next
+power-on.**  The first act on the next boot is the probe, which decides in ~60 s whether the
+rule works; if a session-1 fault follows an AC-cut-with-discharge, the persistence is not in the
+driver's shutdown path and the reset ritual theory dies entirely - the storm is just a race this
+machine is losing more and more often, and the honest framing becomes "a flaky driver on a
+faulted-state machine; budget experiments around probe results, one boot at a time."
