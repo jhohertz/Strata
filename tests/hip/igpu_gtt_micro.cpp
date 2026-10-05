@@ -636,7 +636,7 @@ void thr_spin() {
     while (!g_thr_stop.load(std::memory_order_relaxed)) { std::atomic_thread_fence(std::memory_order_seq_cst); }
 }
 
-int run_gather_arm(long long gib, bool pinned, bool nb, long long pressure_gib, bool scatter,
+int run_gather_arm(long long gib, bool pinned, bool pin_reg, bool nb, long long pressure_gib, bool scatter,
                    bool two_streams, bool sync_rhythm, bool file_cache, int spin_threads) {
     // file_cache: the engine's coexistence state - the 31.64 GiB experts.bin is ALSO resident in
     // the page cache (it was just read into the pinned complement), so the machine carries ~2x
@@ -679,7 +679,7 @@ int run_gather_arm(long long gib, bool pinned, bool nb, long long pressure_gib, 
         if (!host) { std::fprintf(stderr, "igpu_gtt_micro: cannot allocate %lld GiB\n", gib); return 2; }
     }
     for (long long off = 0; off < bytes; off += 4096) std::memset(host + off, (int) (((off >> 12) & 0xff) ^ 0x5a), 4096);
-    if (!pinned && hipHostRegister(host, (size_t) bytes, hipHostRegisterDefault) != hipSuccess) {
+    if ((!pinned || pin_reg) && hipHostRegister(host, (size_t) bytes, hipHostRegisterDefault) != hipSuccess) {
         std::fprintf(stderr, "igpu_gtt_micro: gather arm: register: %s\n", hipGetErrorString(hipGetLastError()));
         return 2;
     }
@@ -748,7 +748,9 @@ int run_gather_arm(long long gib, bool pinned, bool nb, long long pressure_gib, 
     }
     const int64_t na = half / 16, nc = half / 16;
     std::printf("igpu_gtt_micro: gather arm: %d experts x 1.38 MB, %s mapping%s%s, timing per-expert launches\n", kExperts,
-                pinned ? "pinned (the engine's complement)" : "registered", nb ? " + nb" : "", scatter ? " + scattered" : "");
+                pinned ? (pin_reg ? "pinned+registered (the engine's exact state)" : "pinned (no userptr)")
+                       : "registered (userptr, not pinned)",
+                nb ? " + nb" : "", scatter ? " + scattered" : "");
     std::vector<std::thread> thrs;
     if (spin_threads > 0) {
         g_thr_stop = false;
@@ -805,6 +807,7 @@ int run_gather_arm(long long gib, bool pinned, bool nb, long long pressure_gib, 
     CHECK(hipFree(d_flat));
     if (pressure) CHECK(hipFree(pressure));
     if (nb) (void) hipStreamDestroy(s);
+    if (pin_reg) (void) hipHostUnregister(host);
     if (pinned) (void) hipFreeHost(host);
     else {
         (void) hipHostUnregister(host);
@@ -851,13 +854,14 @@ int main(int argc, char** argv) {
             return run_dequant_arm((long long) std::atof(argv[i + 1]), nb, pressure, thp, dev, pinned);
         }
         if (std::strcmp(argv[i], "--gather") == 0 && i + 1 < argc) {
-            bool pinned = true, nb = false, scatter = false, two_streams = false, sync_rhythm = false,
-                 file_cache = false;
+            bool pinned = true, pin_reg = false, nb = false, scatter = false, two_streams = false,
+                 sync_rhythm = false, file_cache = false;
             int spin_threads = 0;
             long long pressure = 0;
             for (int j = i + 2; j < argc; ++j) {
                 if (std::strcmp(argv[j], "thr") == 0 && j + 1 < argc) spin_threads = std::atoi(argv[++j]);
                 if (std::strcmp(argv[j], "reg") == 0) pinned = false;
+                else if (std::strcmp(argv[j], "pr") == 0) pin_reg = true;   // pinned AND registered: the engine's state
                 else if (std::strcmp(argv[j], "nb") == 0) nb = true;
                 else if (std::strcmp(argv[j], "sc") == 0) scatter = true;
                 else if (std::strcmp(argv[j], "2s") == 0) two_streams = true;
@@ -865,8 +869,8 @@ int main(int argc, char** argv) {
                 else if (std::strcmp(argv[j], "fc") == 0) file_cache = true;
                 else if (argv[j][0] >= '0' && argv[j][0] <= '9') pressure = (long long) std::atof(argv[j]);
             }
-            return run_gather_arm((long long) std::atof(argv[i + 1]), pinned, nb, pressure, scatter, two_streams,
-                                  sync_rhythm, file_cache, spin_threads);
+            return run_gather_arm((long long) std::atof(argv[i + 1]), pinned, pin_reg, nb, pressure, scatter,
+                                  two_streams, sync_rhythm, file_cache, spin_threads);
         }
     }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;

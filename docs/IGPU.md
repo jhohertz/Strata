@@ -1600,3 +1600,41 @@ clean power-off (no hung process to kill - the ErP deep-sleep path the user enab
 and sufficient from a cleanly-degraded state; (b) the bisect ladder from P2.11 still stands for
 finding what extends the budget further (UMA first - the conservation math makes it the
 mechanical suspect - then IOMMU, C-states, ErP).
+
+## P2.12b: fresh-boot confirmation, the headroom corrected, and the mapping-mode matrix
+
+Fresh boot (19:05, normal power-off - no hung process, the ErP path), canary clean (396),
+longfill 35.0 tok/s, zero restore/MES lines.
+
+**The headroom arithmetic corrected (measured, this boot):** a full run's fixed host-RAM demand
+beyond the 31.64 GiB complement is ~7 GiB (MemAvailable floor 14.8 of 53.5 during the run -
+process + the model file's page cache + working set).  The session state is 0.17 GiB at 4096
+cells and lives in the 8 GiB **dedicated carve**, not host RAM - the "~8 GiB session from GTT"
+that P2.12 put in the conservation sum was the old-era binary's number (the 0.1.36 engine's
+session is much smaller).  So the alias headroom is 8 GiB (4 OS reserve + 4 working set, the
+community rules), not 14, and the accounting line now says what it measures.  The era failures
+re-read as: 45 GiB visible - 31.64 pinned = 13.4 GiB for process + page cache + working set, a
+working margin inside which the kernel reclaimed continuously - chronic reclaim, not OOM.
+
+**The mapping-mode matrix (the micro's gather arm, 31 GiB, 512 experts x 1.38 MB, per-expert
+launches):**
+
+| mapping | per-expert gather | flat copy of the same bytes |
+|---|---|---|
+| pinned (hipHostAlloc Mapped, no userptr) | 27.22 GB/s | 35.39 GB/s |
+| registered userptr (malloc + hipHostRegister - the engine's complement state) | 22.12 GB/s | 29.49 GB/s |
+| pinned + registered | impossible - hipHostAlloc(Mapped) is already mapped; re-registration is refused | - |
+
+The "pinned+registered" corner does not exist: the engine's complement is a page-locked malloc
+registered as ONE userptr range, so the `reg` row IS the engine's mapping state.  userptr
+registration costs ~19% here - but the engine's in-gather per-expert cost is 221 us (6.2 GB/s),
+3.5-4.5x slower than the micro running the SAME mapping, SAME kernel, SAME size.  Every
+pattern-level variable is now exonerated (scatter, streams, sync rhythm, file-cache
+coexistence, spin threads, launch count via MMQ_GROUP, and now mapping mode): the in-engine
+per-launch cost is a property of the engine PROCESS's KFD state - the same subsystem the
+restore-worker race lives in.  The micro never faults; the engine degrades after ~10-11
+sessions.  The two symptoms (slow launches, fault cluster) point at one object.  Closing the
+last gap (which part of the process state) would need the cost measured inside the engine,
+which the DEGRADED guard and the session budget make expensive; it is parked as the open
+question, with the working characterization: prefill 34-35 tok/s = expert FLOPs at APU rate
+(17.5 s) + gather at ~1/4 micro rate (8.8 s, process-state-bound) + non-expert (7.4 s).
