@@ -628,7 +628,38 @@ __global__ void micro_copy16_kernel(const uint4* __restrict__ a, int64_t na, con
     else if (i < na + nb + nc) c_dst[i - na - nb] = c[i - na - nb];
 }
 
-int run_gather_arm(long long gib, bool pinned, bool nb, long long pressure_gib) {
+// igpu-rework P2.7: the engine's 8 expert-pool worker threads, as busy spinners - if the CPU
+// contention (driver workqueue, doorbell flush, scheduler) changes the per-launch cost, the
+// gather rate drops when these are on.
+std::atomic<bool> g_thr_stop{false};
+void thr_spin() {
+    while (!g_thr_stop.load(std::memory_order_relaxed)) { std::atomic_thread_fence(std::memory_order_seq_cst); }
+}
+
+int run_gather_arm(long long gib, bool pinned, bool nb, long long pressure_gib, bool scatter,
+                   bool two_streams, bool sync_rhythm, bool file_cache, int spin_threads) {
+    // file_cache: the engine's coexistence state - the 31.64 GiB experts.bin is ALSO resident in
+    // the page cache (it was just read into the pinned complement), so the machine carries ~2x
+    // 31.6 GiB of the same data and the kernel's page-cache/THP activity runs during the gathers.
+    // If the gather rate drops with the file cache present, the coexistence (reclaim/THP churn on
+    // the GTT path) is the engine's 2.3 ms/kernel gap.
+    long long fc_bytes = 0;
+    uint8_t* fc = nullptr;
+    if (file_cache) {
+        const char* fp = "/home/jhohertz/co/Strata/packs/qwen38-flash-next-q2_0/experts.bin";
+        const int f = open(fp, O_RDONLY);
+        if (f < 0) { std::fprintf(stderr, "igpu_gtt_micro: gather arm: cannot open %s\n", fp); return 2; }
+        fc_bytes = (long long) lseek(f, 0, SEEK_END);
+        fc = (uint8_t*) mmap(nullptr, (size_t) fc_bytes, PROT_READ, MAP_PRIVATE, f, 0);
+        close(f);
+        if (fc == MAP_FAILED) { std::fprintf(stderr, "igpu_gtt_micro: gather arm: mmap of experts.bin failed\n"); return 2; }
+        // read it in (page cache fill, like the engine's complement copy just did)
+        volatile uint8_t sink = 0;
+        for (long long off = 0; off < fc_bytes; off += 1ll << 20) sink += fc[off];
+        (void) sink;
+        std::printf("igpu_gtt_micro: gather arm: experts.bin in the page cache (%.2f GiB) alongside the pinned region\n",
+                    (double) fc_bytes / 1073741824.0);
+    }
     constexpr int kExperts = 512;
     constexpr size_t half = 460800, blob = 1382400;   // gate | up | down, Q2_0 640x2560 / 2560x640
     const long long bytes = gib * (1ll << 30);
@@ -675,23 +706,70 @@ int run_gather_arm(long long gib, bool pinned, bool nb, long long pressure_gib) 
     }
     hipStream_t s = 0;
     if (nb) CHECK(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
-    // the engine's prefault: one full DMA read pass over the expert region
+    // sync_rhythm: the engine's per-layer cadence - a small D2H (the routed ids) + a FULL stream
+    // sync after every 16 experts, then a small H2D (slot/src) before the next batch
+    uint8_t* h_ids = nullptr;
+    uint8_t* d_ids = nullptr;
+    if (sync_rhythm) {
+        h_ids = (uint8_t*) std::malloc(4096);
+        CHECK(hipMalloc(&d_ids, 4096));
+        std::printf("igpu_gtt_micro: gather arm: engine rhythm - D2H + full sync every 16 experts\n");
+    }
+    // the engine runs its small D2H/H2D copies on a SECOND non-blocking stream (m.copy) while the
+    // gathers run on m.cs - if the second queue changes the driver's doorbell path, the gather
+    // launch cost should jump when this is on
+    hipStream_t s2 = 0;
+    uint8_t* s2buf = nullptr;
+    if (two_streams) {
+        CHECK(hipStreamCreateWithFlags(&s2, hipStreamNonBlocking));
+        CHECK(hipMalloc(&s2buf, 4096));
+        std::printf("igpu_gtt_micro: gather arm: second non-blocking stream active (the engine's m.copy)\n");
+    }
+    // the engine's prefault: one full DMA read pass over the expert region (the WHOLE region when
+    // scattered, as the engine's routing picks experts from across the 31.64 GiB complement)
     uint8_t* ping = nullptr;
     CHECK(hipMalloc(&ping, 4 << 20));
-    for (long long off = 0; off < (long long) kExperts * (long long) blob; off += 4ull << 20)
-        CHECK(hipMemcpy(ping, host + off, (size_t) std::min<long long>(4ll << 20, (long long) kExperts * (long long) blob - off),
-                        hipMemcpyHostToDevice));
+    const long long pf_span = scatter ? bytes : (long long) kExperts * (long long) blob;
+    for (long long off = 0; off < pf_span; off += 4ull << 20)
+        CHECK(hipMemcpy(ping, host + off, (size_t) std::min<long long>(4ll << 20, pf_span - off), hipMemcpyHostToDevice));
     CHECK(hipDeviceSynchronize());
+    // scattered offsets: deterministic LCG over the whole region, blob-aligned (the engine's per-layer
+    // routing reads ~36 experts at spread positions per section)
+    std::vector<long long> sc_off(kExperts, 0);
+    if (scatter) {
+        unsigned long long rng = 0x9e3779b97f4a7c15ull;
+        const long long slots = bytes / (long long) blob;
+        for (int e = 0; e < kExperts; ++e) {
+            rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+            sc_off[e] = (long long) ((rng >> 17) % (unsigned long long) slots) * (long long) blob;
+        }
+        std::printf("igpu_gtt_micro: gather arm: %d experts at SCATTERED offsets across %.1f GiB (the engine's routing pattern)\n",
+                    kExperts, (double) bytes / 1073741824.0);
+    }
     const int64_t na = half / 16, nc = half / 16;
-    std::printf("igpu_gtt_micro: gather arm: %d experts x 1.38 MB, %s mapping%s, timing per-expert launches\n", kExperts,
-                pinned ? "pinned (the engine's complement)" : "registered", nb ? " + nb" : "");
+    std::printf("igpu_gtt_micro: gather arm: %d experts x 1.38 MB, %s mapping%s%s, timing per-expert launches\n", kExperts,
+                pinned ? "pinned (the engine's complement)" : "registered", nb ? " + nb" : "", scatter ? " + scattered" : "");
+    std::vector<std::thread> thrs;
+    if (spin_threads > 0) {
+        g_thr_stop = false;
+        for (int t = 0; t < spin_threads; ++t) thrs.emplace_back(thr_spin);
+        std::printf("igpu_gtt_micro: gather arm: %d busy-spin worker threads (the engine's pool)\n", spin_threads);
+    }
     const auto g0 = std::chrono::steady_clock::now();
     for (int e = 0; e < kExperts; ++e) {
-        const uint8_t* b = base + (long long) e * (long long) blob;
+        const uint8_t* b = scatter ? base + sc_off[e] : base + (long long) e * (long long) blob;
         micro_copy16_kernel<<<(unsigned) ((2 * na + nc + 255) / 256), 256, 0, s>>>((const uint4*) b, na, (const uint4*) (b + half),
                                                                                   na, (uint4*) (d_gu + (long long) e * 2 * half),
                                                                                   (const uint4*) (b + 2 * half), nc,
                                                                                   (uint4*) (d_d + (long long) e * half));
+        if (two_streams && (e % 16) == 15)   // the engine's per-layer small copies on the other stream
+            CHECK(hipMemcpyAsync(s2buf, host + (size_t) e * 4096, 4096, hipMemcpyHostToDevice, s2));
+        if (sync_rhythm && (e % 16) == 15) {   // the engine's per-layer ids readback + full drain
+            CHECK(hipMemcpyAsync(d_ids, host + (size_t) e * 4096, 4096, hipMemcpyHostToDevice, s));
+            CHECK(hipMemcpyAsync(h_ids, d_ids, 4096, hipMemcpyDeviceToHost, s));
+            CHECK(hipStreamSynchronize(s));   // the engine's per-layer full drain
+            CHECK(hipMemcpyAsync(d_ids, h_ids, 4096, hipMemcpyHostToDevice, s));
+        }
     }
     CHECK(hipStreamSynchronize(s));
     const long long g_ms =
@@ -709,6 +787,18 @@ int run_gather_arm(long long gib, bool pinned, bool nb, long long pressure_gib) 
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - f0).count();
     std::printf("igpu_gtt_micro: gather arm: one flat copy of the same bytes in %lld ms: %.2f GB/s\n", f_ms,
                 total_bytes / 1e9 / (f_ms / 1000.0));
+    if (two_streams) {
+        CHECK(hipStreamSynchronize(s2));
+        CHECK(hipFree(s2buf));
+        (void) hipStreamDestroy(s2);
+    }
+    if (sync_rhythm) {
+        CHECK(hipFree(d_ids));
+        free(h_ids);
+    }
+    if (fc) (void) munmap(fc, (size_t) fc_bytes);
+    g_thr_stop = true;
+    for (auto& t : thrs) t.join();
     CHECK(hipFree(ping));
     CHECK(hipFree(d_gu));
     CHECK(hipFree(d_d));
@@ -761,14 +851,22 @@ int main(int argc, char** argv) {
             return run_dequant_arm((long long) std::atof(argv[i + 1]), nb, pressure, thp, dev, pinned);
         }
         if (std::strcmp(argv[i], "--gather") == 0 && i + 1 < argc) {
-            bool pinned = true, nb = false;   // pinned = the engine's complement mapping
+            bool pinned = true, nb = false, scatter = false, two_streams = false, sync_rhythm = false,
+                 file_cache = false;
+            int spin_threads = 0;
             long long pressure = 0;
             for (int j = i + 2; j < argc; ++j) {
+                if (std::strcmp(argv[j], "thr") == 0 && j + 1 < argc) spin_threads = std::atoi(argv[++j]);
                 if (std::strcmp(argv[j], "reg") == 0) pinned = false;
                 else if (std::strcmp(argv[j], "nb") == 0) nb = true;
+                else if (std::strcmp(argv[j], "sc") == 0) scatter = true;
+                else if (std::strcmp(argv[j], "2s") == 0) two_streams = true;
+                else if (std::strcmp(argv[j], "sr") == 0) sync_rhythm = true;
+                else if (std::strcmp(argv[j], "fc") == 0) file_cache = true;
                 else if (argv[j][0] >= '0' && argv[j][0] <= '9') pressure = (long long) std::atof(argv[j]);
             }
-            return run_gather_arm((long long) std::atof(argv[i + 1]), pinned, nb, pressure);
+            return run_gather_arm((long long) std::atof(argv[i + 1]), pinned, nb, pressure, scatter, two_streams,
+                                  sync_rhythm, file_cache, spin_threads);
         }
     }
     const bool thp = argc > 1 && std::strcmp(argv[1], "--thp") == 0;

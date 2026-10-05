@@ -1140,3 +1140,124 @@ reboots in between (25-28) each killed one suspect: the mmq path, the stream
 type, and the VRAM/scale state.  All three turns out to have been innocent
 of the actual bug (a missing `h_ptrs_` assignment) - but the dump that
 proved it was built by the boot that came before them.
+
+## P2.7: the micro exoneration table, the section shape, and the launch-cost picture (2026-10-04 late night, post power cycle)
+
+The machine came up at 21:09 after the first FULL power cycle (hold the power button).
+`p2_boot_run6.sh` ran the gate, then longfill alias with `STRATA_HOSTLOOP=1` +
+`STRATA_PREFILL_TIMING=1` + `STRATA_SSD_KEEPALIVE=0`:
+
+```
+PASS  longfill
+strata prefill timing: 1162 tokens, GPU timeline 32468 ms, wall 32468 ms, host staging 0 ms: ...
+strata prefill hostloop: 144 expert sections, host 32255 ms, gpu span 24573 ms (max section host 1595.9 / gpu 237.5 ms)
+therm.log: max 60.0 C, max 65.1 W
+```
+
+The three arithmetic smokes then passed (arithmetic/python/marker, all PASS).  The
+thermal log was clean all the way (peak 60 C / 65 W - the same peak as the healthy
+September characterization, far from the ~95 C throttle point).  **The full power
+cycle fixed the fault; a plain reboot did not.**  The fault state survives reboots;
+it needs the power to go fully off.
+
+### The hostloop numbers, read correctly
+
+host 32255 ms ~= wall 32468 ms, gpu span 24573 ms.  The first reading - "host-bound,
+the host is 7.9 s behind" - was wrong.  The host time is almost entirely the
+per-section `cudaStreamSynchronize` waiting for the GPU (max section host 1595.9 ms
+against a 237.5 ms GPU span = the host blocked on the previous section's work plus
+the sync).  The non-expert GPU phases (qsa 1.56 s, gdn 3.87 s, hc 1.26 s, router,
+ple, attn) tile the rest: 24.57 + 7.9 = 32.5 s = the wall.  **The alias prefill is
+GPU-saturated; there is no 7.9 s of host-bound slack to recover.**
+
+### The section shape, measured (STRATA_TRACE)
+
+`resident 39738` = the number of expert computations (the gather launches), and the
+per-section trace line shows **173-284 routed experts per section, average 284**
+(512-token chunk, 48 layers, top-k routing over 512 experts).  So per section:
+~284 gathers + 18 groups x (gu + swiglu + quantize + dn + 2 memsets).  The earlier
+"36 experts/section" arithmetic (35.5 = 5110/144) was a misread: 5110 was a P1-era
+stat with a different meaning, not this count.
+
+### Per-launch cost, recomputed with the right section shape
+
+Per prompt: ~39,700 gathers + ~2,600 gu products + ~2,600 dn products + ~5,000 other
+launches = ~50,000 launches over 32.5 s = 0.65 ms/launch wall.  The gemm phases alone
+(16.0 s for ~5,200 products + swiglu + quantizes) average ~3 ms/product; the gather
+phase (8.4 s for ~39,700 gathers) averages ~211 us/gather.  The micro's same gather
+kernel over the same bytes runs at 45-70 us each (30-35 GB/s sustained).  **In-engine
+launches cost ~3-10x the micro's, on the same machine state, with every process-state
+variable the micro can reproduce ruled out below.**
+
+### The micro exoneration table (all same boot, post power cycle, 31 GiB pinned unless noted)
+
+| arm | result | verdict |
+|---|---|---|
+| `--gather 31` (per-expert, contiguous) | 32.17 GB/s | baseline |
+| `--gather 31 sc` (SCATTERED offsets across the full 31 GiB, the engine's routing pattern) | 35.39 GB/s | scatter/TLB exon |
+| `--gather 31 8` (+8 GiB VRAM session pressure) | 30.77 GB/s | VRAM pressure exon |
+| `--gather 31 2s` (second non-blocking stream, the engine's m.copy) | 32.17 GB/s | queue count exon |
+| `--gather 31 nb 2s` (the engine's exact stream config) | 32.17 GB/s | stream type exon |
+| `--gather 31 sr` (engine rhythm: D2H + full sync every 16 experts) | 29.49 GB/s | sync rhythm exon |
+| `--gather 31 nb sr` | 30.77 GB/s | sync rhythm exon |
+| `--gather 31 fc` (31.64 GiB experts.bin ALSO in the page cache, the engine's RAM state) | 33.70 GB/s | page-cache coexistence exon |
+| `--gather 31 thr 8` (8 busy-spin worker threads, the engine's pool) | 32.17 GB/s | CPU contention exon |
+
+Nothing the micro can express reproduces the engine's ~211 us/gather.  The remaining
+differences are the interleaved MMQ/BLAS product kernels, the count of loaded code
+objects/buffers, and the engine's total process state.  The A/B on the f16 path
+(`STRATA_PREFILL_MMQ=0`, same boot) is the telling datapoint: **its phase profile is
+near-identical to the MMQ path** (dequant 8380 vs 8401 ms, gemm gu 12019 vs 12036 ms,
+gemm dn 3986 vs 4003 ms) despite completely different kernels in every phase - the
+wall is set by the number of launches and their in-engine cost, not by any kernel's
+compute.  Every expert path (MMQ int8, f16+BLAS, PF_FUSED) landing at ~39 tok/s is
+the same fact from the other side.
+
+### The lever: fewer launches (STRATA_MMQ_GROUP)
+
+`mmq_group()` now honors `STRATA_MMQ_GROUP` (default 16, the dGPU build unchanged):
+the group buffers scale linearly (16 -> 64 experts: ~21 MB -> ~85 MB, trivial for the
+16 GiB VRAM), and the per-group product launches drop 4x (18 groups/section -> 5).
+If the in-engine launch cost is ~0.5-3 ms, collapsing the ~5,200 gemm-side launches
+is the single biggest available win; the gather side (39,700 launches) is the bigger
+prize but needs a batched-gather kernel (one launch per group instead of per expert).
+Queued for the next boot as `p2_boot_run7.sh`: gate, then longfill with
+STRATA_MMQ_GROUP=64 / 32 / 16 (HOSTLOOP + TIMING on all three), same-boot A/B.
+
+## P2.8: the fault cluster returns on a healthy-looking boot (2026-10-04 23:13)
+
+The post-power-cycle boot was clean for four engine runs (longfill PASS 35.8 tok/s,
+longfill MMQ=0 PASS, three smokes PASS) and several micro runs, with clean thermals
+(peak 60 C / 65 W during load).  Then the STRATA_TRACE longfill (the fifth engine
+run) degraded: 71 of 144 sections completed in ~8 minutes (~6.7 s/section, 30x the
+normal 0.22 s/section), and it faulted with the same signature as the Oct 4 04:2x
+cluster:
+
+```
+Oct 04 23:13:09 kernel: amdgpu 0000:66:00.0: MES failed to respond to msg=REMOVE_QUEUE
+Oct 04 23:13:09 kernel: amdgpu 0000:66:00.0: failed to remove hardware queue from MES, doorbell=0x1202
+Oct 04 23:13:09 kernel: amdgpu 0000:66:00.0: MES might be in unrecoverable state, issue a GPU reset
+Oct 04 23:13:09 kernel: amdgpu 0000:66:00.0: Failed to remove queue 2
+Oct 04 23:13:09 kernel: amdgpu 0000:66:00.0: GPU reset begin!. Source:  3
+```
+
+with `error: unspecified launch failure` in the engine's stderr.  Three refinements
+to the fault record:
+
+1. **The fault happens at clean thermals.**  This run's load profile peaked at the
+   same 60 C / 65 W as the passing runs.  The ~95 C throttle association from the
+   first cluster is not a trigger.
+2. **The fault is a spectrum with a degraded slow phase before the hard hang.**  This
+   run ran at 6.7 s/section for ~8 minutes before faulting; the 04:2x-12:5x cluster
+   showed the same slow-then-hang shape.  The machine enters the slow phase after an
+   unpredictable number of healthy runs (10 on the Oct 3-4 boot, 4 on this one) and
+   stays there (across reboots) until a full power cycle.
+3. **The micro never shows the slow phase.**  Between and around the degraded/faulting
+   engine runs, the micro's gather arm held 30-35 GB/s.  The degradation is specific
+   to the engine process (its queue usage under the full 31.64 GiB complement +
+   sustained product load), not to the machine's DRAM/GTT path.
+
+Operating rule updated: after a full power cycle, a boot is good for roughly 4-5 heavy
+engine runs before the degraded phase appears; budget experiments accordingly (the
+MMQ_GROUP A/B is exactly that size), and treat any section running >1 s/section as
+"stop now, do not reboot, power cycle" (a reboot does not clear it).

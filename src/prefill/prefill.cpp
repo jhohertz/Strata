@@ -27,6 +27,7 @@
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
+#include <cstdlib>   // igpu-rework P2.7: atoi for STRATA_MMQ_GROUP
 
 #include <cuda_runtime.h>
 
@@ -511,7 +512,17 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 // Step 2b: which layers' experts go through MMQ (both weight types covered; the Strata Q2_0 pack always - its blob
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
 // gate/up and down matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
-constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
+constexpr int kMmqGroupDefault = 16;           // experts per MMQ launch (the gather is per expert, as blobs arrive)
+// igpu-rework P2.7: STRATA_MMQ_GROUP overrides the group size (fewer, bigger product launches; the group buffers
+// scale linearly with it).  Default 16 keeps the dGPU build byte-identical.
+int mmq_group() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_MMQ_GROUP");
+        const int x = e ? std::atoi(e) : kMmqGroupDefault;
+        return (x >= 1 && x <= 128) ? x : kMmqGroupDefault;
+    }();
+    return v;
+}
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
@@ -650,7 +661,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     {
-        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
+        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / mmq_group() + 2));
         const char* gc = std::getenv("STRATA_GROUP_COPY");
         if (m.grp_n < need && !(gc && gc[0] == '1')) {
             if (m.grp_host) cudaFreeHost(m.grp_host);
@@ -775,9 +786,9 @@ bool Prefill::carve(size_t T, void* alloc) {
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
-        m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
-        m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / mmq_group() + 2)), ok);
+        m.grp_gu = o.take<uint8_t>((size_t) mmq_group() * mp.gu_max + MMQ_TAIL, ok);
+        m.grp_d = o.take<uint8_t>((size_t) mmq_group() * mp.d_max + MMQ_TAIL, ok);
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
@@ -996,9 +1007,9 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
-        o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / mmq_group() + 2)), ok);
+        o.take<uint8_t>((size_t) mmq_group() * mp.gu_max + MMQ_TAIL, ok);
+        o.take<uint8_t>((size_t) mmq_group() * mp.d_max + MMQ_TAIL, ok);
     }
     for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
@@ -1811,14 +1822,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (checks_on && !xcheck("after mmq quantize")) return false;
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                             // reads the group's own quantized H)
-                            const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
-                            m.bounds_host.resize(n + 1 + ng * (MMQ_GROUP + 1));
+                            const int mg = mmq_group();
+                            const size_t n = order.size(), ng = (n + mg - 1) / mg;
+                            m.bounds_host.resize(n + 1 + ng * (mg + 1));
                             for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) order[j]];
                             m.bounds_host[n] = (int32_t) (T * K);
                             for (size_t g = 0; g < ng; ++g)
-                                for (size_t i = 0; i <= MMQ_GROUP; ++i)
-                                    m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
-                                        m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
+                                for (size_t i = 0; i <= (size_t) mg; ++i)
+                                    m.bounds_host[n + 1 + g * (mg + 1) + i] =
+                                        m.bounds_host[std::min(n, g * mg + i)] - m.bounds_host[g * mg];
                             if (grp_mapped) {
                                 int32_t* bh = m.grp_host + 3 * m.grp_tk;
                                 std::memcpy(bh, m.bounds_host.data(), m.bounds_host.size() * 4);
@@ -1890,7 +1902,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             pt.mark(kPfDequant, cs);
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
-                                const size_t q = j % MMQ_GROUP;
+                                const size_t q = j % (size_t) mmq_group();
                                 if (lay.native) {
                                     const auto& f = lay.fmt[(size_t) l];
                                     mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
@@ -1900,9 +1912,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 }
                                 if (checks_on && !xcheck("after the expert gather")) return false;
                                 if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
-                                if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                if (q + 1 < (size_t) mmq_group() && j + 1 < order.size()) return true;
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
-                                const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                                const size_t j0 = j - q, g = j0 / (size_t) mmq_group(), n = order.size();
                                 const int ngx = (int) (q + 1);
                                 const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
                                 int64_t maxr = 0;
@@ -1922,7 +1934,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
                                 mmq::Product dn;
                                 dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
-                                dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
+                                dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * ((size_t) mmq_group() + 1);
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
                                 m.mmq_ctx->run(dn, m.cs);
@@ -2040,7 +2052,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfCombine, cs);
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     if (checks_on && !xcheck("after moe_combine")) return false;
-                    if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: layer %lld moe done\n", (long long) l); std::fflush(stderr); }   // igpu-rework P1 hang hunt
+                    if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: layer %lld moe done, experts %zu\n", (long long) l, n_order); std::fflush(stderr); }   // igpu-rework P1 hang hunt / P2.7 section sizing
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
