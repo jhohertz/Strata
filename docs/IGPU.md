@@ -1469,3 +1469,41 @@ rule works; if a session-1 fault follows an AC-cut-with-discharge, the persisten
 driver's shutdown path and the reset ritual theory dies entirely - the storm is just a race this
 machine is losing more and more often, and the honest framing becomes "a flaky driver on a
 faulted-state machine; budget experiments around probe results, one boot at a time."
+
+## P2.10: the driver-race test matrix (2026-10-05, user-led: BIOS + module parameters)
+
+Position: not hardware (faults at 60 C/65 W, micro always fast, MODE2 heals in seconds),
+most likely the kernel driver's queue/userptr path - the fault's own strings are
+driver-internal (`amdgpu_amdkfd_restore_userptr_worker`, `MES failed to respond to
+msg=REMOVE_QUEUE`, `Failed to evict process queues`, `Failed to quiesce KFD`) and the
+kernel even prints its own advice: "consider switching to WQ_UNBOUND" (a workqueue
+maintainer note about this exact worker).
+
+### BIOS items (change ONE per boot, probe first, record here)
+
+| setting | try | why it is on the list |
+|---|---|---|
+| IOMMU (AMD-Vi) | off (or on - make it consistent) | the cmdline is self-contradictory (`iommu=off amd_iommu=on`); KFD SVM + IOMMU is a classic hang area; GTT/DMA mapping behavior changes with it |
+| Global C-states Control | disabled | CPU deep sleep vs queue-doorbell/MES wake; the standard amdgpu-hang workaround; matches "breaks under sustained load" |
+| Power Supply Idle Control | Typical Idle | the documented Ryzen instability setting (cTLP class) |
+| Above 4G Decoding / Re-Size BAR (SAM) | toggle | changes how host memory is BAR/GTT-addressed for the iGPU |
+| ErP / deep sleep in S5 | enabled | guarantees standby rails are cut - the honest version of "the power cycle"; if MES/SMU package state survived our power-off, ErP On removes the loophole |
+| Memory Context Restore / Fast Boot | disabled | rules out cross-boot persistence of memory training/context state |
+| iGPU UMA (VRAM) size | 4-8 GiB instead of 16 | the box reserves 16 GiB "VRAM" + GTT accounting to 48 GiB (KFD reports 51.5 GB of heaps on 45 GiB of RAM - oversubscribed); GTT allocation pressure is exactly what the restore worker churns through |
+| BIOS/AGESA version | latest | AGESA updates fix iGPU/microcode instability on 7000-series |
+
+### amdgpu module parameters (grub `GRUB_CMDLINE_LINUX` additions; one per boot, with the probe)
+
+| parameter | purpose |
+|---|---|
+| `amdgpu.debug_evictions=1` | DIAGNOSTIC: logs the queue-eviction machinery the fault hangs in - the leading indicator becomes a labeled event |
+| `amdgpu.mes=0` | THE TEST: if MES is the component hanging, removing it changes everything (gfx11 may fall back to the legacy KIQ path or refuse - visible at boot in dmesg; both answers are informative) |
+| `amdgpu.gpu_recovery=0` | stops the MODE2 resets; the P2.9e evidence is that the resets deepen the state (degree 1 -> 2); without recovery a hung job just stays hung (worse for usability, better for forensics - and `queue_preemption_timeout_ms` / `lockup_timeout` modulate it) |
+| `amdgpu.noretry=0` (or on) | the GPUVM fault retry path is what the restore worker walks; flipping retry changes the race |
+| `amdgpu.max_num_of_queues_per_device` / `hws_max_conc_proc` | lower the per-process queue budget - the faulting teardown fails at "evict queue 3"; fewer queues per session = less MES queue-table churn |
+
+### Boot journal for the test sequence
+
+| boot | change | probe | result |
+|---|---|---|---|
+| (fill in) | | | |
