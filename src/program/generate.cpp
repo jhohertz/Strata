@@ -2802,6 +2802,32 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 if (okp) {
+                    // igpu-rework P2.12: the alias headroom (14 GiB default = ~8 GiB session + ~1.5 GiB dense +
+                    // 4 GiB OS/request reserve, the community's APU sizing rules) - declared first: the accounting
+                    // line below and the #403 check both use it.  The old value, min(user headroom, 2 GiB), could
+                    // not see the session this run was about to take from the same RAM pool the complement lives in.
+                    static const uint64_t igpu_alias_headroom = [] {
+                        const char* v = std::getenv("STRATA_IGPU_HEADROOM_GIB");
+                        return v && std::atof(v) > 0 ? (uint64_t) (std::atof(v) * 1073741824.0) : 14ull << 30;
+                    }();
+                    // igpu-rework P2.12: shared-memory accounting, printed at startup so a misfit is diagnosable
+                    // then instead of discovered as chronic reclaim later.  On an iGPU the GPU's GTT pool is host
+                    // RAM - the "free VRAM" the GPU reports does not subtract what this run takes from the same
+                    // pool (the session, the dense weights, the OS reserve); the community's four rules for APU
+                    // sizing (docs/IGPU.md P2.12) exist because treating the GTT capacity as independent VRAM
+                    // oversubscribes the box.  The complement line below states its size; this line states the pool.
+                    if (const auto avail = strata::core::conversation_available_memory(); avail) {
+                        const int64_t session =
+                            (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
+                        std::fprintf(stderr,
+                                     "strata generate: igpu shared memory: %.2f GiB of host RAM available; this run "
+                                     "will take the expert complement (next line) + the session (%.2f GiB) + the "
+                                     "dense weights from it, keeping the %.0f GiB headroom (session/dense/OS) clear - "
+                                     "the GPU's addressable pool is this same RAM, not extra VRAM (docs/IGPU.md P2.12)\n",
+                                     (double) *avail / 1073741824.0, (double) session / 1073741824.0,
+                                     (double) igpu_alias_headroom / 1073741824.0);
+                        std::fflush(stderr);
+                    }
                     // Measured on this APU (docs/IGPU.md): the KFD/GTT path cannot map a FILE-backed VMA to the
                     // GPU at all - a 1 GiB file slice faults with an illegal access while anonymous regions of the
                     // same address are read at 82.6 GB/s.  So the alias table must point at anonymous RAM, not the
@@ -2820,7 +2846,7 @@ int main(int argc, char** argv) {
                         xcache.close();
                         okp = false;
                     } else {
-                        const uint64_t alias_headroom = std::min<uint64_t>(o.resident_headroom, 2ull << 30);
+                        const uint64_t alias_headroom = igpu_alias_headroom;
                         // igpu-rework P1 run 17: a pageable complement hangs the driver - the first kernel read
                         // starts a GTT page-fault storm over 31.6 GiB while a lazy kernel-module load (the PLE
                         // postops' first launch, hsa_executable_freeze -> blit) is in flight, and the two HSA

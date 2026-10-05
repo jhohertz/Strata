@@ -1555,3 +1555,48 @@ Protocol status: the 4-run budget no longer applies (keep the probe + DEGRADED g
 standard hygiene until the 2-3 boot confirmation is in, then retire the ritual language from
 the run scripts).  The fault work's deliverable is the diagnosis (this section + P2.6/P2.8-9e)
 and the bisect ladder; the P2 performance work now runs on a machine that holds a boot.
+
+## P2.12: the community's APU sizing rules name the mechanism - and this boot's later sessions correct P2.11
+
+A community APU effort reported the exact failure mode we chased for three days, in their
+words: `hipMemGetInfo()` reports the large GPU-addressable GTT pool **without subtracting the
+engine's ordinary CPU allocations** (including its host expert arena); treating that capacity as
+independent VRAM oversubscribes system memory and invokes the OOM killer.  Their four rules:
+(1) label GTT capacity as shared GPU memory, (2) do not add shared GPU memory to system RAM when
+deciding which model fits, (3) cap automatic expert-cache sizing on currently available host
+memory, (4) leave 4 GiB for the OS and request-time CPU work.
+
+Mapped onto this machine, the conservation arithmetic explains the whole era: the box has
+**64 GiB of physical RAM**.  16-GiB-UMA boots: 45 GiB visible to the OS; the engine put the
+31.64 GiB arena and the ~8 GiB session (the GTT pool - host RAM, not the dedicated carve; the
+KFD heap read 48 GiB) and the ~1.5 GiB dense weights into that same 45 GiB: 31.64 + 8 + 1.5 +
+~8 OS = ~49-51 vs 45 - **oversubscribed 4-6 GiB**, living in the chronic-reclaim zone where the
+restore-worker race lives (it walks the 31.64 GiB userptr's GTT tables; under reclaim those
+pages move out from under the walk).  8-GiB-UMA boots: 53.5 GiB visible; the same demand leaves
+~4 GiB of headroom - fits, and the race stops contending.  That is why the BIOS pass (which
+among other things halved the carve) changed the fault behavior, and it makes the earlier
+"budget of 4-5 sessions" read as the reclaim zone's tolerance, not a hardware budget.
+
+The engine's own #403 safety check had the right structure (MemAvailable minus a headroom) but a
+blind spot: the alias path used `min(user headroom, 2 GiB)`, and MemAvailable does not know the
+run is about to take another ~8 GiB of session from the same pool.  Now (this commit): the alias
+headroom is **14 GiB** (~8 session + ~1.5 dense + 4 OS reserve, the community rule 4),
+`STRATA_IGPU_HEADROOM_GIB` overrides per box, and startup prints the shared-memory accounting
+(host RAM available vs complement + session + headroom) so a misfit is diagnosable then instead
+of as chronic reclaim later.  On a 45-GiB box the 31.64 GiB complement is now refused with a
+clear message instead of OOM territory.  Rule 2 (the model-fit picker in setup) is the same
+conservation law and goes there when setup touches the APU path.
+
+**Correction to P2.11, measured after the fact:** this boot did NOT stay clean.  After the
+7 longfills + 3 smokes, sessions ~11-12 (the P2.12 verification smokes) began emitting
+**degenerate repetition** (the arithmetic smoke's `17*23+5` answer became a `#$%#*` token loop)
+- the fault family's silent-corruption stage: wrong outputs, clean process, zero
+restore/MES lines in the journal.  The pre-change binary fails identically (it is the machine,
+not the build).  So the honest statement: the BIOS changeset **extended the boot budget from
+4-5 sessions to ~10-11**, roughly 2.5x, and left a silent-corruption stage before the hang -
+a real, large, but not complete fix.  Two usable artifacts: (a) the arithmetic smoke is a
+**canary** - run it between experiments; a degenerate answer means the boot is spent, and a
+clean power-off (no hung process to kill - the ErP deep-sleep path the user enabled) is safe
+and sufficient from a cleanly-degraded state; (b) the bisect ladder from P2.11 still stands for
+finding what extends the budget further (UMA first - the conservation math makes it the
+mechanical suspect - then IOMMU, C-states, ErP).
