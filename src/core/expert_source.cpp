@@ -900,9 +900,18 @@ void FileExpertSource::close() {
     io_stop();
     inputs_.clear();
     if (complement_arena_ != nullptr) {
-        if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
-        else {
-            if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
+        // igpu-rework P2.9: the chunked registration is released chunk by chunk (hipHostUnregister takes the
+        // pointer only, and each chunk is its own userptr range)
+        if (!complement_chunks_.empty()) {
+            for (void* p : complement_chunks_) (void) cudaHostUnregister(p);
+            std::free(complement_arena_);
+        } else {
+            if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
+            else {
+                if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
+                if (gpu_register_bytes_ > 0)
+                    (void) cudaHostUnregister((uint8_t*) complement_arena_ + gpu_register_off_);
+            }
             if (complement_locked_ > 0)
                 strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
             std::free(complement_arena_);
@@ -930,10 +939,14 @@ void FileExpertSource::close() {
     complement_partial_ = false;
     complement_registered_ = false;
     complement_pin_limit_ = 0;
+    complement_chunks_.clear();
+    complement_ranges_.clear();
     complement_lock_off_ = 0;
     complement_ready_ = false;
     complement_locked_ = 0;
     complement_lent_slots_ = 0;
+    gpu_register_off_ = 0;
+    gpu_register_bytes_ = 0;
     if (!maps_.empty()) {
         for (Map& m : maps_) {
 #if defined(_WIN32)
@@ -2197,14 +2210,24 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
+    // igpu-rework P2.9: STRATA_IGPU_PIN_CHUNK_GIB (GiB): register the complement as chunked userptr
+    // ranges instead of one (see the branch below).  0 = the single cudaHostAlloc registration (default).
+    static const uint64_t chunk_gib_g = [] {
+        const char* v = std::getenv("STRATA_IGPU_PIN_CHUNK_GIB");
+        return v && std::atof(v) > 0 ? (uint64_t) std::atof(v) : 0;
+    }();
     auto release = [&]() {
         if (arena == nullptr) return;
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
-            if (partial_pin > 0) (void) cudaHostUnregister(arena);
+            if (!complement_chunks_.empty()) {   // igpu-rework P2.9: the chunked registration (unregister per chunk)
+                for (void* p : complement_chunks_) (void) cudaHostUnregister(p);
+            } else if (partial_pin > 0) (void) cudaHostUnregister(arena);
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
             std::free(arena);
         }
+        complement_chunks_.clear();
+        complement_ranges_.clear();
         arena = nullptr;
     };
 #if defined(__linux__)
@@ -2260,7 +2283,71 @@ bool FileExpertSource::pin_cache_complement(
             }
         }
 #endif
-        if (pin && !paced) {
+        if (pin && chunk_gib_g > 0) {
+            // igpu-rework P2.9: register the arena as N chunked userptr ranges instead of one.  The
+            // driver's userptr restore worker operates per range (amdgpu_amdkfd_restore_userptr_worker
+            // in the fault journals, docs/IGPU.md P2.6/P2.8); one 31.64 GiB range is the biggest single
+            // restore unit the machine carries, and it is the subsystem named in every fault.  Each
+            // chunk is cut at an expert boundary so a blob never straddles two registrations (the same
+            // rule the partial pin uses).  P0 measured chunked hipHostRegister regions kernel-readable
+            // (the --reg arms); the DMA prefault pass still installs the GTT entries afterwards.
+            arena = std::malloc((size_t) bytes);
+            if (arena == nullptr) { err = "FileExpertSource: chunked complement allocation failed"; return false; }
+            uint64_t c_off = 0;
+            bool c_all = true;
+            int c_n = 0;
+            std::vector<void*> c_bases;   // the registered chunk bases (hipHostUnregister takes the pointer only)
+            std::vector<std::pair<uint64_t, uint64_t>> c_ranges;
+            while (c_off < bytes) {
+                uint64_t w = std::min<uint64_t>(bytes - c_off, chunk_gib_g << 30);
+                for (size_t i = 0; i < offsets.size(); ++i) {
+                    if (offsets[i] == kNoComplement) continue;
+                    const uint64_t b = layer_blob_bytes_[i / (size_t) n_expert_];
+                    if (offsets[i] >= c_off && offsets[i] < c_off + w && offsets[i] + b > c_off + w) { w = offsets[i] - c_off; break; }
+                }
+                if (w == 0) { c_all = false; break; }
+                if (cudaHostRegister((void*) ((uint8_t*) arena + c_off), (size_t) w, cudaHostRegisterMapped | cudaHostRegisterPortable)
+                    != cudaSuccess) { (void) cudaGetLastError(); c_all = false; break; }
+                c_bases.push_back((void*) ((uint8_t*) arena + c_off));
+                c_ranges.emplace_back(c_off, w);
+                c_off += w;
+                ++c_n;
+            }
+            auto c_unmap = [&]() {
+                for (auto it = c_bases.rbegin(); it != c_bases.rend(); ++it) (void) cudaHostUnregister(*it);
+                c_bases.clear();
+            };
+            if (c_all && c_off == bytes) {
+                void* alias = nullptr;
+                const cudaError_t aliased = cudaHostGetDevicePointer(&alias, arena, 0);
+                if (aliased == cudaSuccess && alias != nullptr) {
+                    device = (const uint8_t*) alias;
+                    partial_pin = bytes;   // fully page-locked, but by N registrations: released as partial
+                    pinned_ok = false;
+                    complement_chunks_ = std::move(c_bases);
+                    complement_ranges_ = std::move(c_ranges);   // DMAs must stay inside one range
+                    note = "page-locked and mapped in " + std::to_string(c_n) + " chunked registrations (" +
+                           std::to_string(chunk_gib_g) + " GiB each)";
+                } else {
+                    note = std::string("chunked pin: no device alias (") + cudaGetErrorString(aliased) +
+                           "); falling back to the single registration";
+                    (void) cudaGetLastError();
+                    c_unmap();
+                    partial_pin = 0;
+                    std::free(arena);
+                    arena = nullptr;   // fall through to the single cudaHostAlloc registration
+                }
+            } else {
+                note = std::string("chunked pin: registration stopped at ") +
+                       std::to_string((double) c_off / 1073741824.0) + " GiB of " +
+                       std::to_string((double) bytes / 1073741824.0) + "; falling back to the single registration";
+                c_unmap();
+                partial_pin = 0;
+                std::free(arena);
+                arena = nullptr;   // fall through to the single cudaHostAlloc registration
+            }
+        }
+        if (pin && arena == nullptr && !paced) {
             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                          cudaHostAllocMapped | cudaHostAllocPortable);
             if (allocated == cudaSuccess) {
@@ -2736,6 +2823,41 @@ const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) co
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (index >= complement_offsets_.size()) return nullptr;
     return resident_blob(index);   // through the rotation's ownership table when STRATA_EXCHANGE_ROTATE is on
+}
+
+bool FileExpertSource::register_complement_for_gpu(std::string& err) {
+    err.clear();
+    if (!complement_ready_ || complement_host_ == nullptr) return true;   // no complement: nothing to do
+    if (gpu_register_bytes_ > 0) return true;
+    // A full pin registered the whole arena; a partial pin registered its first pin_limit_ bytes.
+    const uint64_t registered = complement_pinned_ ? complement_bytes_ : complement_pin_limit_;
+    if (registered >= complement_bytes_) return true;
+    uint8_t* at = (uint8_t*) complement_host_ + registered;
+    const uint64_t n = complement_bytes_ - registered;
+    if (cudaHostRegister(at, (size_t) n, cudaHostRegisterDefault) == cudaSuccess) {
+        gpu_register_off_ = registered;
+        gpu_register_bytes_ = n;
+        return true;
+    }
+    const std::string refused = cudaGetErrorString(cudaGetLastError());
+    // Fallback: a full H2D pass registers by touching (measured 36.3 GB/s, 32 GiB in 946 ms on the 780M).
+    uint8_t* d = nullptr;
+    const size_t chunk = 1ull << 30;
+    if (cudaMalloc((void**) &d, chunk) != cudaSuccess) {
+        err = "the driver refused to register the " + std::to_string(n / (1ull << 30)) +
+              " GiB complement suffix (" + refused + ") and the fallback DMA buffer could not be allocated";
+        return false;
+    }
+    for (uint64_t off = 0; off < complement_bytes_; off += chunk) {
+        const size_t b = (size_t) std::min<uint64_t>(chunk, complement_bytes_ - off);
+        if (cudaMemcpy(d, complement_host_ + off, b, cudaMemcpyHostToDevice) != cudaSuccess) {
+            (void) cudaFree(d);
+            err = "the driver refused to register the complement (" + refused + ") and the fallback DMA pass failed";
+            return false;
+        }
+    }
+    (void) cudaFree(d);
+    return true;   // DMA-touched: kernel-readable, nothing to unregister
 }
 
 const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
@@ -3307,10 +3429,11 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
                                               cs);
         if (d.hit_cpu_order)
             strata::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
-                d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
+                d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale, nullptr,
+                d.cache_blob_ptrs);
         else
             strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
-                d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
+                d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale, d.cache_blob_ptrs);
         d.hit_pending = true;
         if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
         // The A/B arm: ONE driver entry here, and nothing else changes.  If the work was waiting for the host

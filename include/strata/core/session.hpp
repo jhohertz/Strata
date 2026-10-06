@@ -416,6 +416,7 @@ struct TokenHits {
     int64_t n_expert = 0;
     const uint8_t* cache_base = nullptr; ///< slot 0 of the VRAM expert arena
     int64_t blob = 0;                    ///< bytes per slot
+    const uint64_t* d_blob = nullptr;    ///< igpu-rework: per-slot host pointers (alias cache; null: the arena)
     int32_t* d_slot = nullptr;           ///< device, k entries
     int32_t* d_dst = nullptr;            ///< device, k entries
     int32_t* d_count = nullptr;          ///< device, 1
@@ -423,7 +424,7 @@ struct TokenHits {
     float* x_scale = nullptr;            ///< and its fp32 scales (the CPU pool's contract)
     void* scratch = nullptr;             ///< moe_hit_grouped_scratch_bytes(k, ...)
     float* hit_out = nullptr;            ///< device, k * n_embd
-    bool on() const { return d_res && cache_base && d_slot && d_dst && d_count && x_q8 && x_scale && scratch && hit_out; }
+    bool on() const { return d_res && (cache_base || d_blob) && d_slot && d_dst && d_count && x_q8 && x_scale && scratch && hit_out; }
 };
 
 bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, SessionState& s, float* parts_dev,

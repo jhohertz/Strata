@@ -69,9 +69,12 @@ uint64_t moe_hit_grouped_scratch_bytes(int64_t n_hits, int64_t n_embd, int64_t n
 /// (`2r` = gate, `2r+1` = up), the down codes follow, and each plane's scales are fp16 - which is the ONE
 /// difference from `s_gemv_q8`'s S-forms, whose scales are fp32.  That difference is why this is a separate
 /// kernel rather than a call into the dense path.
+// `d_blob` (igpu-rework, null on the copy path): per-slot 64-bit host pointers into the GTT-mapped expert file
+// (the aliasing cache of an integrated GPU, docs/IGPU.md).  Non-null, the kernels read `d_blob[slot]` instead of
+// `blob_base + slot * blob_bytes`; `blob_base` then serves only as the alignment probe.
 void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
                         int64_t n_hits, int64_t blob_bytes, const uint8_t* x_q8_0, void* scratch, float* out,
-                        void* stream, const float* x_scales = nullptr);
+                        void* stream, const float* x_scales = nullptr, const uint64_t* d_blob = nullptr);
 
 /// Experimental CPU-order implementation. Eight CUDA lanes reproduce the CPU VNNI accumulator lanes,
 /// fused multiply-add order, separate correction, and final horizontal reduction. The input must use
@@ -87,7 +90,8 @@ void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_exp
                     int32_t* count, void* stream);
 void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
                             const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
-                            void* scratch, float* out, void* stream, const float* x_scales);
+                            void* scratch, float* out, void* stream, const float* x_scales,
+                            const uint64_t* d_blob = nullptr);
 void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const int32_t* count, int64_t cap,
                  int64_t n_embd, void* stream);
 /// Plan v0.3 P6 verify window: `moe_hit_select` over `n` <= 128 routed entries (T tokens x k, flattened), and the
@@ -109,7 +113,8 @@ void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int
                           int32_t* count, void* stream);
 void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
                               const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
-                              const float* x_scales, int k_per_token, void* scratch, float* out, void* stream);
+                              const float* x_scales, int k_per_token, void* scratch, float* out, void* stream,
+                              const uint64_t* d_blob = nullptr);
 /// The per-hit kernels (`moe_hit_grouped_s2`, `_dev`, `_multi`) and the grouped ones (`moe_grouped_s2`)
 /// were rewritten with bitwise-identical outputs: conflict-free staged activations, `hx` once per chunk, wide loads,
 /// two rows per warp.  The previous kernels stay for A/B: `STRATA_OLD_GROUPED=1` in the environment selects them,
@@ -126,6 +131,7 @@ int moe_grouped_last_path();
 void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_index,
                                  const int32_t* dst_index, int64_t n_hits, int64_t blob_bytes,
                                  const uint8_t* x_q8_0, void* scratch, float* out, void* stream,
-                                 const float* x_scales, float* gate_up_trace = nullptr);
+                                 const float* x_scales, float* gate_up_trace = nullptr,
+                                 const uint64_t* d_blob = nullptr);
 
 }  // namespace strata::kernels

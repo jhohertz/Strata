@@ -39,6 +39,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/native_ple_postops.hpp"   // igpu-rework P1: the code-object warmup
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -4449,11 +4450,196 @@ int main(int argc, char** argv) {
         int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
         int failed = 0;
         int zero_reads = 0;
+        // igpu-rework (docs/IGPU.md): on an integrated GPU the expert "arena" is a copy of data the kernel can
+        // already read (P0: host-buffer reads at the exact device-buffer rate, 82.6 GB/s; the 0.1.36 prefill
+        // spent 20.6 s of its 33 s in exactly this copy path, and the CPU pool the misses feed is what sets the
+        // floor).  Alias instead: one 64-bit host pointer per (layer, expert) in a 196 KiB device table, every
+        // expert resident, the pool sees no misses.  Needs stable, non-transient blobs - the --mmap-experts file
+        // mapping.  STRATA_IGPU_ALIAS=1 forces it, =0 forces the copy path; the default is automatic on an
+        // integrated device (cudaDevAttrIntegrated).
+        bool alias_opened = false;
+        {
+            const char* env = std::getenv("STRATA_IGPU_ALIAS");
+            int integrated = 0;
+            (void) cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0);
+            const bool want_alias = env != nullptr ? env[0] == '1' : integrated == 1;
+            if (want_alias) {
+                bool okp = srcp != nullptr;
+                for (int64_t l = 0; okp && l < g.n_layers; ++l)
+                    for (int64_t e = 0; okp && e < g.n_expert; ++e) okp = !srcp->transient(l, e);
+                if (okp && !xcache.open_aliased(g.n_layers, g.n_expert, err)) {
+                    std::fprintf(stderr, "strata generate: igpu alias cache: %s\n", err.c_str());
+                    return 1;
+                }
+                if (okp) {
+                    // igpu-rework P2.12b: the alias headroom.  The community APU rules say: cap the complement on
+                    // available host RAM, keep 4 GiB clear for the OS and request-time CPU work.  Measured on this
+                    // box (P2.12b, this boot): a full run's fixed host-RAM demand beyond the 31.64 GiB complement
+                    // is ~7 GiB (MemAvailable floor 14.8 of 53.5 during the run: process, the model file's page
+                    // cache, working set) - and the session lives in the 8 GiB dedicated carve, NOT host RAM
+                    // (the "~8 GiB session from GTT" was the old-era binary's number).  So 8 GiB = 4 OS reserve +
+                    // 4 working set, overridable per box.  The pre-P2.12 value, min(user headroom, 2 GiB), left
+                    // none of that clear.
+                    static const uint64_t igpu_alias_headroom = [] {
+                        const char* v = std::getenv("STRATA_IGPU_HEADROOM_GIB");
+                        return v && std::atof(v) > 0 ? (uint64_t) (std::atof(v) * 1073741824.0) : 8ull << 30;
+                    }();
+                    // igpu-rework P2.12: shared-memory accounting, printed at startup so a misfit is diagnosable
+                    // then instead of discovered as chronic reclaim later.  On an iGPU the GPU's GTT pool is host
+                    // RAM - the "free VRAM" the GPU reports does not subtract what this run takes from the same
+                    // pool (the session, the dense weights, the OS reserve); the community's four rules for APU
+                    // sizing (docs/IGPU.md P2.12) exist because treating the GTT capacity as independent VRAM
+                    // oversubscribes the box.  The complement line below states its size; this line states the pool.
+                    if (const auto avail = strata::core::conversation_available_memory(); avail) {
+                        const int64_t session =
+                            (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
+                        std::fprintf(stderr,
+                                     "strata generate: igpu shared memory: %.2f GiB of host RAM available; this run "
+                                     "will take the expert complement (next line) + ~7 GiB of process/page-cache "
+                                     "working set from it, keeping the %.0f GiB headroom (4 OS + 4 working set) "
+                                     "clear; the session (%.2f GiB) lives in the dedicated VRAM carve, not this pool "
+                                     "(docs/IGPU.md P2.12)\n",
+                                     (double) *avail / 1073741824.0, (double) igpu_alias_headroom / 1073741824.0,
+                                     (double) session / 1073741824.0);
+                        std::fflush(stderr);
+                    }
+                    // Measured on this APU (docs/IGPU.md): the KFD/GTT path cannot map a FILE-backed VMA to the
+                    // GPU at all - a 1 GiB file slice faults with an illegal access while anonymous regions of the
+                    // same address are read at 82.6 GB/s.  So the alias table must point at anonymous RAM, not the
+                    // file: build the full complement (every expert, one copy, ~the file's size in RAM) NOW, while
+                    // the cache's residency is still empty - an empty residency makes the complement cover all
+                    // experts - and blob() prefers the complement over the file mapping from then on.  Filled by
+                    // the CPU at SSD speed, once; from here on nothing in the run reads the file.
+                    // The complement is the run's biggest allocation (nothing after it is close), so the
+                    // default 8 GiB safety headroom - sized for the ordinary modes - would reject it on a
+                    // 45 GiB box; cap it at 2 GiB for the alias run.  Only the file source has a complement.
+                    auto* file_src = (srcp == &src) ? &src : nullptr;
+                    if (file_src == nullptr) {
+                        std::fprintf(stderr,
+                                     "strata generate: igpu alias cache: it needs the --mmap-experts file source "
+                                     "(its RAM complement); the copy path continues\n");
+                        xcache.close();
+                        okp = false;
+                    } else {
+                        const uint64_t alias_headroom = igpu_alias_headroom;
+                        // igpu-rework P1 run 17: a pageable complement hangs the driver - the first kernel read
+                        // starts a GTT page-fault storm over 31.6 GiB while a lazy kernel-module load (the PLE
+                        // postops' first launch, hsa_executable_freeze -> blit) is in flight, and the two HSA
+                        // fault-handler threads sit in KFD_MEMORY_PREFAULT (docs/IGPU.md, run 17 backtrace).
+                        // A page-locked allocation (the 260 MiB embedding proves this path on this APU) has no
+                        // lazy faults at all.  pin=false would fall through to malloc + hipHostRegister, which
+                        // the micro passed but the engine does not.
+                        if (file_src->pin_cache_complement(xcache, err, true, {}, -1, alias_headroom,
+                                                           o.resident_budget, nullptr) &&
+                            // the kernels then read this RAM directly; unregistered host memory faults on this
+                            // iGPU (docs/IGPU.md) - register it (no copy) or fall back to the H2D touch
+                            !file_src->register_complement_for_gpu(err)) {
+                            std::fprintf(stderr,
+                                         "strata generate: igpu alias cache: the full RAM complement could not be "
+                                         "built and made kernel-readable (%s); the copy path continues\n",
+                                         err.c_str());
+                            xcache.close();
+                            okp = false;
+                        } else {
+                            std::fprintf(stderr,
+                                         "strata generate: the %.2f GiB expert complement is registered for direct "
+                                         "kernel reads (no H2D copies)\n",
+                                         (double) file_src->resident_bytes() / 1073741824.0);
+                            // igpu-rework P1 run 19: registration and page-locking still leave the complement's GTT
+                            // page tables lazy: the first kernel read of 31.6 GiB starts a driver page-fault storm
+                            // (the two HSA fault-handler threads sit in KFD_IOC_MEMORY_PREFAULT for minutes), and a
+                            // kernel-module load that lands while the storm is draining deadlocks its code-object
+                            // blit (hsa_executable_freeze -> BlitKernel::SubmitLinearCopyCommand - the backtraces of
+                            // runs 16-18).  One DMA read pass over the whole complement installs every page table
+                            // entry before the prompt (the micro's recipe: a full H2D ping is what made its reads
+                            // clean; a partial one left the rest faulting).  ~1 s at the measured 36 GB/s.
+                            {
+                                const uint64_t cbytes = file_src->resident_bytes();
+                                const uint8_t* cbase = file_src->complement_host();
+                                // 4 MiB target: run 20's 1 GiB target exhausted the iGPU's 16 GiB VRAM budget
+                                // (the H2D pass accounted against it) and the prompt's buffers then "did not fit".
+                                // igpu-rework P2.9: the chunked pin registers N separate ranges, and a DMA that
+                                // spans two of them is refused (invalid argument, 16:2x) - so the pass walks the
+                                // registered ranges, staying inside each.
+                                const auto& ranges = file_src->complement_dma_ranges();
+                                std::vector<std::pair<uint64_t, uint64_t>> one_range;
+                                const std::vector<std::pair<uint64_t, uint64_t>>* pf_ranges = &ranges;
+                                if (ranges.empty()) { one_range.emplace_back(0, cbytes); pf_ranges = &one_range; }
+                                uint8_t* d_ping = nullptr;
+                                const size_t chunk = 4ull << 20;
+                                if (cbase != nullptr && cudaMalloc(&d_ping, chunk) == cudaSuccess) {
+                                    const auto pf0 = std::chrono::steady_clock::now();
+                                    bool ok = true;
+                                    for (const auto& rg : *pf_ranges) {
+                                        for (uint64_t off = rg.first; off < rg.first + rg.second; off += chunk) {
+                                            const size_t b = (size_t) std::min<uint64_t>(chunk, rg.first + rg.second - off);
+                                            if (cudaMemcpy(d_ping, cbase + off, b, cudaMemcpyHostToDevice) != cudaSuccess) {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        if (!ok) break;
+                                    }
+                                    (void) cudaDeviceSynchronize();
+                                    // a refused DMA latches into cudaGetLastError and the next kernel's
+                                    // post-launch check would blame its own healthy launch (the 16:2x abort)
+                                    (void) cudaGetLastError();
+                                    (void) cudaFree(d_ping);
+                                    if (ok)
+                                        std::fprintf(stderr, "strata generate: the complement's GTT page tables are "
+                                                             "prefaulted: one DMA read pass over %.2f GiB in %lld ms\n",
+                                                     (double) cbytes / 1073741824.0, (long long) std::chrono::
+                                     duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - pf0)
+                                     .count());
+                                    else
+                                        std::fprintf(stderr,
+                                                     "strata generate: WARNING: the complement prefault pass failed "
+                                                     "(first kernel reads install page tables lazily)\n");
+                                }
+                            }
+                        }
+                    }
+                }
+                if (okp) {
+                    std::vector<uint64_t> ptrs((size_t) g.n_layers * (size_t) g.n_expert, 0);
+                    bool all = true;
+                    for (int64_t l = 0; all && l < g.n_layers; ++l)
+                        for (int64_t e = 0; all && e < g.n_expert; ++e) {
+                            const uint8_t* b = srcp->blob(l, e);
+                            if (b == nullptr) { all = false; break; }
+                            (void) xcache.admit(l, e);
+                            ptrs[(size_t) l * (size_t) g.n_expert + (size_t) e] = (uint64_t) (uintptr_t) b;
+                        }
+                    if (all && !xcache.set_aliased_pointers(ptrs.data(), err)) all = false;
+                    if (all) {
+                        alias_opened = true;
+                        std::fprintf(stderr,
+                                     "strata generate: IGPU ALIAS cache: %lld experts, one 64-bit pointer each into "
+                                     "the RAM complement (table %.0f KiB of device memory; the complement itself is "
+                                     "in host RAM, which the iGPU reads at device rate);\n"
+                                     "                 every expert is resident, so the GPU computes every expert row "
+                                     "and the CPU pool sees no misses (docs/IGPU.md)\n",
+                                     (long long) xcache.slots(), (double) xcache.bytes() / 1024.0);
+                    } else {
+                        xcache.close();
+                        okp = false;
+                    }
+                }
+                if (!okp) {
+                    std::fprintf(stderr,
+                                 "strata generate: igpu alias cache unavailable (it needs stable, non-transient expert "
+                                 "blobs - the --mmap-experts file mapping); STRATA_IGPU_ALIAS=1 forces it, =0 silences "
+                                 "this; the copy path continues\n");
+                }
+            }
+        }
         for (int attempt = 0;; ++attempt) {
             bool ok = false;
             if (fake_fails > 0) {
                 --fake_fails;
                 err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
+            } else if (alias_opened) {   // the alias table opened above is the whole cache
+                ok = true;
             } else {
                 ok = sized_slots.empty()
                     ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
@@ -4485,7 +4671,7 @@ int main(int argc, char** argv) {
 #endif
                 return 1;
             }
-            if (!auto_cache || attempt - failed >= 6) break;
+            if (!auto_cache || attempt - failed >= 6 || alias_opened) break;
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
@@ -4509,8 +4695,14 @@ int main(int argc, char** argv) {
                          o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
     }
     if (o.expert_cache > 0) {
-        std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
-                     (long long) xcache.slots(), xcache.gib());
+        if (xcache.aliases()) {
+            std::fprintf(stderr, "strata generate: expert cache %lld slots (aliasing host pointers: %.0f KiB of device "
+                                 "memory, 0 GiB of blob copies); every expert resident\n",
+                         (long long) xcache.slots(), (double) xcache.bytes() / 1024.0);
+        } else {
+            std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
+                         (long long) xcache.slots(), xcache.gib());
+        }
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -4523,7 +4715,9 @@ int main(int argc, char** argv) {
                      "strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
                      "                 so a reply can differ slightly from a run without the cache (same quality:\n"
                      "                 bench/results/2026-09-27-cache-parity).\n");
-        if (o.expert_cache_per_layer) {
+        if (xcache.aliases()) {
+            // the alias cache is fully resident by construction: there is no admission policy to print
+        } else if (o.expert_cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);
             std::fprintf(stderr, "                 R4.2g PER-LAYER: each layer owns %lld slots (%lld..%lld).\n",
@@ -4533,13 +4727,16 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr, "                 PROFILE, ranked by routing frequency, no eviction.\n");
         }
+    } else if (xcache.aliases()) {
+        std::fprintf(stderr, "strata generate: expert cache (alias) %lld slots: every expert resident, no policy\n",
+                     (long long) xcache.slots());
     }
     // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
     int64_t prefilled = 0;
-    if (!profile.empty() && srcp != nullptr) {
+    if (!profile.empty() && srcp != nullptr && !xcache.aliases()) {   // the alias table is filled above, once
         // #369 (dag08): per layer, a full layer skips only its own pairs - each layer takes its hottest experts until
         // its range is full (one full layer used to end the whole fill, leaving most layers empty)
         const bool per_layer = xcache.per_layer_admission();
@@ -4903,9 +5100,12 @@ int main(int argc, char** argv) {
         }
         drive.d.cache = &xcache;
         drive.d.cache_stream = main_cs;
-        drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
-        drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        // igpu-rework: an alias cache has no arena.  cache_base stays null so every "base + offset" resolution
+        // (the host plan, the device plan, the verify graph) reduces to the per-slot host pointer itself.
+        drive.d.cache_base = xcache.aliases() ? nullptr : (const uint8_t*) xcache.device_slot(0);
+        drive.d.cache_blob = xcache.aliases() ? 0 : (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         drive.d.cache_slot_off = xcache.slot_offsets();
+        drive.d.cache_blob_ptrs = xcache.device_pointer_table();
         drive.d.hit_scratch = hit_scratch;
         drive.d.parts_out = d_parts;
         drive.d.hit_out = d_hit_out;
@@ -5048,6 +5248,50 @@ int main(int argc, char** argv) {
 
     mem_mark("the expert cache and the graphs");
     std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
+    // igpu-rework P1 run 21: the PLE postops TU (native_ple_postops.cu) code object is loaded LAZILY on the
+    // first launch of any of its kernels, and that first launch is the prompt's layer-1 PLE block in every
+    // run (the per-token variant only runs in the decode token loop, which starts after the prompt).  On this
+    // APU a module load that lands mid-prompt deadlocks its code-object blit against the KFD fault handlers
+    // (the backtrace: hipLaunchKernel -> native_ple_postops_batch -> hsa_executable_freeze ->
+    // BlitKernel::SubmitLinearCopyCommand).  One per-token launch here - at init, calm state, finite zero
+    // inputs - loads the code object before the prompt, so the layer-1 launch is an ordinary launch.  The
+    // per-token variant is read-only in the PLE history (the batch variant advances it), so nothing is
+    // corrupted.  Alias mode only: the copy path has always completed this same first launch fine.
+    if (xcache.aliases() && ss.ple.ready()) {
+        const int64_t HD = strata::kernels::NG_HC_DIM;
+        const int64_t N = g.n_embd;
+        float* tmp = nullptr;
+        cudaStream_t wstream = nullptr;
+        if (cudaMalloc(&tmp, (size_t) (8 * HD + N + 4) * sizeof(float)) == cudaSuccess &&
+            cudaStreamCreate(&wstream) == cudaSuccess) {
+            (void) cudaMemset(tmp, 0, (size_t) (8 * HD + N + 4) * sizeof(float));
+            float* p = tmp;
+            auto take = [&](int64_t c) { float* r = p; p += c; return r; };
+            float* pk = take(HD);
+            float* hid = take(HD);
+            float* val = take(N);
+            strata::kernels::NativePlePostopsBuffers bufs;
+            bufs.key = take(HD);
+            bufs.query = take(HD);
+            bufs.gate = take(4);
+            bufs.gated = take(HD);
+            bufs.normalized = take(HD);
+            bufs.conv = take(HD);
+            bufs.result = take(HD);
+            strata::kernels::native_ple_postops(pk, hid, val, ss.ple.hist, ss.ple.w, bufs, (void*) wstream);
+            (void) cudaStreamSynchronize(wstream);   // the load is what matters: done before the prompt starts
+            (void) cudaStreamDestroy(wstream);
+            (void) cudaFree(tmp);
+            std::fprintf(stderr, "strata generate: the PLE postops code object is loaded (one dummy per-token launch)\n");
+        } else {
+            (void) cudaGetLastError();
+            if (wstream) (void) cudaStreamDestroy(wstream);
+            if (tmp) (void) cudaFree(tmp);
+            std::fprintf(stderr,
+                         "strata generate: WARNING: the PLE warmup allocation failed; the code object still "
+                         "loads at the prompt's first PLE launch\n");
+        }
+    }
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
             return strata::core::lm_head(wt, g, ss.block, d_logits, stream, err);
@@ -5509,6 +5753,7 @@ int main(int argc, char** argv) {
         }
         thits.cache_base = drive.d.cache_base;
         thits.blob = drive.d.cache_blob;
+        thits.d_blob = xcache.device_pointer_table();
         thits.d_slot = drive.d.d_slot;
         thits.d_dst = drive.d.d_dst;
         thits.d_count = d_hit_count;
@@ -6152,7 +6397,14 @@ int main(int argc, char** argv) {
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
-        if (pf_borrow && d_res != nullptr) {
+        // igpu-rework: an alias cache holds the expert DATA itself in the region its slots name (the GTT-mapped
+        // host complement) - there is no spare arena to carve the prompt's buffers from, and the loan's refill
+        // could not restore what the carve overwrote (docs/IGPU.md P2.14: the 74-token prompt bug).  The prompt
+        // path takes its own buffers, exactly as the one-shot path already does.
+        if (xcache.aliases() && (pf_borrow || d_res != nullptr))
+            std::fprintf(stderr, "strata serve: the alias cache holds the expert data itself: the prompt path uses "
+                                 "its own buffers (nothing is lent)\n");
+        if (pf_borrow && d_res != nullptr && !xcache.aliases()) {
             pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
             for (auto& st : stages)
                 pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});
@@ -10926,7 +11178,9 @@ int main(int argc, char** argv) {
     if (o.prefill_chunk > 0 && n_prompt > 1) {
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
-        if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
+        if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr && !xcache.aliases()) {
+            // igpu-rework: an alias cache has no arena to lend; the prompt path takes its own buffers instead
+            // ("no cache slots to borrow")
             int64_t chunk = o.prefill_chunk;
             int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
             const int64_t request_sized = equal_chunk(n_batched, chunk);
@@ -10994,6 +11248,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: entering the token loop\n"); std::fflush(stderr); }   // igpu-rework P1 hang hunt
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();

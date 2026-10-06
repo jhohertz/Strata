@@ -1629,7 +1629,9 @@ ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   
                 "gfx1030": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1031": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1151": "https://rocm.nightlies.amd.com/v2/gfx1151/",       # Strix Halo (docs/STRIX_HALO.md)
-                "gfx1103": "https://rocm.nightlies.amd.com/v2/gfx110X-all/"}   # Radeon 780M: only with STRATA_EXPERIMENTAL_GFX1103=1
+                # gfx1103 is an iGPU: the -dgpu package holds no gfx1103 libraries (checked in the wheel's file
+                # list, 2026-10-02) - the family-wide -all package does.
+                "gfx1103": "https://rocm.nightlies.amd.com/v2/gfx110X-all/"}   # Radeon 780M: validated on the reference APU (docs/GFX1103.md)
 # The TheRock nightly indexes are pruned and move on, and each GPU family's index holds its own range (#1103: gfx103X-all
 # starts at 7.13.0a20260422 and has no 7.10; #1267: the 7.10 wheel segfaults on a Strix Halo with kernel 7.2.8), so one
 # version for every card cannot work.  The wheel is chosen per index (the family): a preferred version, tried first; when
@@ -1637,7 +1639,7 @@ ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   
 # STRATA_ROCM_VERSION still forces one exact version (no lookup).
 ROCM_VERSION_DEFAULT = "7.10.0a20251120"                 # what Strata's HIP build was tested with (gfx120X, gfx110X)
 ROCM_FAMILY_PINS = {"gfx103X-all": "7.13.0a20260515",    # #1103: 7.13.0a20260515 runs; the 7.14 nightlies time out
-                    "gfx110X-all": "7.10.0a20251121",    # the experimental gfx1103: this index has no ...20251120
+                    "gfx110X-all": "7.10.0a20251121",    # the gfx1103 iGPU's family: this index has no ...20251120
                     "gfx1151": "7.14.0a20260608"}        # #1267: 7.14.0a20260529 to 20260608 run on kernel 7.2.8; the 7.10 wheel segfaults
 ROCM_VERSION_OVERRIDE = os.environ.get("STRATA_ROCM_VERSION") or None
 ROCM_VERSION = ROCM_VERSION_OVERRIDE or ROCM_VERSION_DEFAULT   # kept for callers that read one version
@@ -1645,7 +1647,7 @@ ROCM_SYSTEM_MIN = (7, 0)       # an older system ROCm is passed over for the whe
 # STRATA_EXPERIMENTAL_GFX1103=1 (opt-in, unsupported): the Radeon 780M / 760M / 740M iGPU (Ryzen 7040 / 8040, gfx1103) is taken
 # as a unified-memory AMD card like Strix Halo, with the portable kernels (no WMMA) (measured on one machine: Ryzen 7 255).  Unset: unchanged.
 GFX1103_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1103") == "1"
-AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151") + (("gfx1103",) if GFX1103_OPT_IN else ())
+AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151")
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs has no product name
              "gfx1101": "AMD Radeon RX 7800 XT / 7700 XT (gfx1101)",
              "gfx1102": "AMD Radeon RX 7600 / 7600 XT (gfx1102)",
@@ -2366,6 +2368,7 @@ def rocm_root(archs):
         fail(f"cards of two GPU families ({', '.join(archs)}) need a system ROCm 7 (in /opt/rocm): AMD's Python "
              "wheels come per family", "install ROCm 7 system-wide, or use cards of one family (--gpu N for one card)")
     index = indexes[0]
+    version = list(dict.fromkeys(rocm_version_for(a) for a in archs))[0]   # one family, one version
     stamp = Path(sys.prefix) / ".strata-rocm.json"
     have = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
     wheel = None

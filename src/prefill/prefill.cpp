@@ -33,6 +33,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/prefill/kernels.hpp"
+#include <cstdlib>   // igpu-rework P2.7: atoi for STRATA_MMQ_GROUP
 
 #include <cuda_runtime.h>
 
@@ -591,6 +592,12 @@ struct PeerPrefill {
 };
 
 struct Prefill::Impl {
+    // STRATA_HOSTLOOP=1 (igpu-rework P2.4): the expert section (host grouping -> moe_combine) per layer,
+    // host wall time vs the GPU span on the compute stream.  host ~ wall: launch-bound; gpu ~ wall with
+    // small host: the kernels are slow.  (debug only; dGPU path untouched - nothing prints without the env)
+    struct HostLoopSample { double host_ms; cudaEvent_t a; cudaEvent_t b; };
+    std::vector<HostLoopSample> hostloop;
+    bool hostloop_degraded = false;   // igpu-rework P2.9: the live slow-phase warning fired
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
     core::SessionState* ss = nullptr;
@@ -599,7 +606,7 @@ struct Prefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
     bool borrowed = false;
-    cudaStream_t cs = nullptr, copy = nullptr;
+    cudaStream_t cs = nullptr, copy = nullptr, cs_own = nullptr;   // cs_own: the alias-blocking test (run 27)
     Gemm gemm;
     std::vector<void*> owned;
     // chunk buffers
@@ -767,6 +774,10 @@ void Prefill::release() {
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
+    if (impl_->cs_own) {
+        if (impl_->cs == impl_->cs_own) cudaStreamSynchronize(impl_->cs_own);
+        cudaStreamDestroy(impl_->cs_own);
+    }
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) cudaFreeHost(p);
@@ -806,6 +817,9 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
 // gate/up and down matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
 constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
+                                               // (the igpu-rework STRATA_MMQ_GROUP override, docs/IGPU.md P2.7, was not
+                                               // carried to 0.1.40: 16/32/64 measured identical, and the group_gather
+                                               // rewrite this engine takes makes the override a moving target)
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
@@ -891,6 +905,18 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     Impl& m = *impl_;
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
+    // igpu-rework P1 run 27: on this APU every registered-complement read on the LEGACY stream is clean
+    // (the micro, the engine's prefault DMA, the BLAS warmup), while the engine's dequant - the first
+    // complement read on a NON-BLOCKING stream - faults (a NULL-base IMA, dmesg 0x0-0x6000).  Env-gated:
+    // STRATA_IGPU_BLOCKING_CS recreates m.cs as a BLOCKING stream (default flag: it orders with the
+    // legacy stream) for alias caches, so the dequant's complement reads take the legacy queue context.
+    // The dGPU path is untouched (the env var and the alias cache are both required).
+    if (std::getenv("STRATA_IGPU_BLOCKING_CS") && cache && cache->aliases() && m.cs_own == nullptr) {
+        if (cudaStreamCreate(&m.cs_own) != cudaSuccess) { err = "prefill: the alias blocking compute stream";
+            return false;
+        }
+        m.cs = m.cs_own;
+    }
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
@@ -1080,8 +1106,8 @@ bool Prefill::carve(size_t T, void* alloc) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
-        m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        m.grp_gu = o.take<uint8_t>((size_t) MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
+        m.grp_d = o.take<uint8_t>((size_t) MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
@@ -1600,8 +1626,8 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
-        o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        o.take<uint8_t>((size_t) MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
+        o.take<uint8_t>((size_t) MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
     }
     if (owned_pages) {
         if (ring_slots(T) > 0) o.take<uint8_t>((size_t) ring_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
@@ -2177,6 +2203,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
+            if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt layer %lld\n", (long long) l); std::fflush(stderr); }   // igpu-rework P1 hang hunt
+            // igpu-rework P1 run 24: named error checks - an async IMA in the expert section used to sit
+            // unreported (no check) until the stream died silently and the run hung 900 s.  Gated:
+            // STRATA_PREFILL_CHECKS=1 (adds a sync per section; the dGPU path is untouched by default).
+            static const bool checks_on = std::getenv("STRATA_PREFILL_CHECKS") != nullptr;
+            auto xcheck = [&m, &err, l](const char* where) -> bool {
+                if (const cudaError_t e2 = cudaStreamSynchronize(m.cs); e2 != cudaSuccess) {
+                    err = "prefill: layer " + std::to_string(l) + " " + where + ": " + cudaGetErrorString(e2);
+                    std::fprintf(stderr, "prefill: %s\n", err.c_str());
+                    return false;
+                }
+                return true;
+            };
             const core::LayerView v(*m.wt, l);
             if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
@@ -2685,6 +2724,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     } else {
                         // group the (token, k) pairs by expert on the host
                         pt.mark(kPfHostGroup, cs);
+                        bool hl_on = false;
+                        cudaEvent_t hl_a = nullptr, hl_b = nullptr;
+                        if (static const bool hle = std::getenv("STRATA_HOSTLOOP") != nullptr; hle) {
+                            hl_on = true;
+                            if (cudaEventCreate(&hl_a) == cudaSuccess && cudaEventCreate(&hl_b) == cudaSuccess)
+                                cudaEventRecord(hl_a, m.cs);
+                            else {
+                                hl_on = false;
+                                if (hl_a) cudaEventDestroy(hl_a);
+                                if (hl_b) cudaEventDestroy(hl_b);
+                            }
+                        }
+                        const auto hl_t0 = Clock::now();
                         // (the sync below also orders this layer's writes of slot/src/bounds after the previous
                         // layer's kernels that read them)
                         const bool grp_mapped = m.grp_host != nullptr;
@@ -2905,16 +2957,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
                             mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
+                            if (checks_on && !xcheck("after mmq quantize")) return false;
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                             // reads the group's own quantized H)
-                            const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
-                            m.bounds_host.resize(n + 1 + ng * (MMQ_GROUP + 1));
+                            const int mg = MMQ_GROUP;
+                            const size_t n = order.size(), ng = (n + mg - 1) / mg;
+                            m.bounds_host.resize(n + 1 + ng * (mg + 1));
                             for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) order[j]];
                             m.bounds_host[n] = (int32_t) rows_local;
                             for (size_t g = 0; g < ng; ++g)
-                                for (size_t i = 0; i <= MMQ_GROUP; ++i)
-                                    m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
-                                        m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
+                                for (size_t i = 0; i <= (size_t) mg; ++i)
+                                    m.bounds_host[n + 1 + g * (mg + 1) + i] =
+                                        m.bounds_host[std::min(n, g * mg + i)] - m.bounds_host[g * mg];
                             if (grp_mapped) {
                                 int32_t* bh = m.grp_host + 3 * m.grp_tk;
                                 std::memcpy(bh, m.bounds_host.data(), m.bounds_host.size() * 4);
@@ -3125,6 +3179,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             p_release_to(l, (int32_t) m.g->n_expert, m.pp->s);
                             cudaSetDevice(pd);
                         }
+                        if (checks_on && !xcheck("after the bounds upload")) return false;
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
                         int stage_next = 0;
                         std::vector<int> stage_of(order.size(), -1);
@@ -3240,6 +3295,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 }
                                 if (slot >= 0 && !group_gather) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                if (checks_on && !xcheck("after the expert gather")) return false;
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
                                 const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
@@ -3257,6 +3313,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
                                 m.mmq_ctx->run(gu, m.cs);
                                 mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                                if (checks_on && !xcheck("after the gu product")) return false;
                                 pt.mark(kPfGemmD, cs);
                                 mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
                                 mmq::Product dn;
@@ -3265,27 +3322,63 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
                                 m.mmq_ctx->run(dn, m.cs);
+                                if (checks_on && !xcheck("after the dn product")) return false;
                                 return true;
                             }
                             const int q = (int) (j % DQ);
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
+                                // igpu-rework P1 run 26: the run 25 fault window covered this whole block;
+                                // name each kernel so the next fault names its launch (STRATA_PREFILL_CHECKS).
+                                // run 28: the dump is BEFORE the launch - run 26's was after the fault point
+                                // (the check that fails is right after this kernel) and never printed.
+                                if (std::getenv("STRATA_TRACE") && l == 0 && j == 0)
+                                    std::fprintf(stderr,
+                                                 "strata trace: compute l=%d e=%d ne=%lld o0=%lld blob=%p blob+up=%p "
+                                                 "dq_gu[q=%d]=%p dq_d=%p Xs=%p GU=%p Hh=%p Dm=%p | fmt gu=%d d=%d "
+                                                 "up_off=%llu down_off=%llu n_ff=%lld n_embd=%lld host_res=%d\n",
+                                                 l, e, (long long) m.cnt[(size_t) e], (long long) m.off[(size_t) e],
+                                                 (const void*) blob_dev, (const void*) (blob_dev + f.up_off), q,
+                                                 (void*) m.dq_gu[q], (void*) m.dq_d[q], (const void*) m.Xs,
+                                                 (void*) m.GU, (void*) m.Hh, (void*) m.Dm, f.gu_type, f.d_type,
+                                                 (unsigned long long) f.up_off, (unsigned long long) f.down_off,
+                                                 (long long) f.n_ff, (long long) f.n_embd,
+                                                 m.host_res ? m.host_res[(size_t) l * m.g->n_expert + e] : -1);
                                 strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                    m.dq_gu[q], m.cs);
+                                if (checks_on && !xcheck("after dequant gu")) return false;
                                 strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                if (checks_on && !xcheck("after dequant d")) return false;
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
+                                if (checks_on && !xcheck("after blob dequant")) return false;
                             }
                             if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             pt.mark(kPfGemmGU, cs);
                             m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                            if (checks_on && !xcheck("after gu gemm")) return false;
                             swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                            if (checks_on && !xcheck("after swiglu")) return false;
                             pt.mark(kPfGemmD, cs);
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            if (checks_on && !xcheck("after dn gemm")) return false;
                             return true;
                         };
+                        // igpu-rework P1 run 25: the dmesg fault is a NULL-base read (GPU VA 0x0-0x6000, 4 KiB
+                        // stride) in this section - report the VRAM left when it first happens (an unchecked
+                        // allocation under the iGPU's 16 GiB budget is the leading candidate for the null).
+                        if (std::getenv("STRATA_TRACE") && use_mmq) {
+                            static bool vr1 = false;
+                            if (!vr1) {
+                                vr1 = true;
+                                size_t vf = 0, vt = 0;
+                                if (cudaMemGetInfo(&vf, &vt) == cudaSuccess)
+                                    std::fprintf(stderr, "strata trace: VRAM at first expert section: %.1f / %.1f MiB free\n",
+                                                 (double) vf / 1048576.0, (double) vt / 1048576.0);
+                            }
+                        }
                         if (!stream_all) {
                             size_t staged = 0;
                             size_t pending = 0;
@@ -3350,7 +3443,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             release_to(m.g->n_expert);
                         }
+                        if (hl_on) {
+                            cudaEventRecord(hl_b, m.cs);
+                            const double hl_ms = ms_since(hl_t0);
+                            m.hostloop.push_back({hl_ms, hl_a, hl_b});
+                            // igpu-rework P2.9: live degradation guard - a healthy section is ~0.2 s of host
+                            // wall (the first section is ~1.6 s of warmup: skip the first five), a degraded
+                            // machine takes ~7 s per section (docs/IGPU.md P2.8).  Warn once; the run's
+                            // numbers are not comparable and the next run in this boot will fault.
+                            if (m.hostloop.size() > 5 && hl_ms > 2000.0 && !m.hostloop_degraded) {
+                                m.hostloop_degraded = true;
+                                std::fprintf(stderr,
+                                             "strata prefill hostloop: DEGRADED section (host wall %.0f ms, "
+                                             "healthy ~220 ms) - the machine's slow phase has started; this run's "
+                                             "result is not comparable, and the next run in this boot will fault "
+                                             "(docs/IGPU.md P2.8)\n", hl_ms);
+                                std::fflush(stderr);
+                            }
+                        }
                     }
+                    if (checks_on && !xcheck("after the expert computes")) return false;
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail
                         if (cpu_share_env() < 0.0) cudaEventRecord(m.cpu_ev[1], m.cs);   // after the GPU's expert work
@@ -3373,6 +3485,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
                     }
                     moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    if (checks_on && !xcheck("after moe_combine")) return false;
+                    if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: layer %lld moe done, experts %zu\n", (long long) l, n_order); std::fflush(stderr); }   // igpu-rework P1 hang hunt / P2.7 section sizing
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
@@ -3547,6 +3661,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // stage can return while later GPUs are still processing the previous chunk.
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
+    if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr,
+        "strata trace: prompt done: %lld chunk(s), %lld resident expert computes, %lld staged\n",
+        (long long) stats_.chunks, (long long) stats_.experts_resident, (long long) stats_.experts_streamed); std::fflush(stderr); }   // igpu-rework P1 hang hunt
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         cudaStreamSynchronize(m.cs);
         auto bad = [&](const float* d, int64_t n) {
@@ -3628,6 +3745,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             line += h;
         }
         std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
+    }
+    {
+        // STRATA_HOSTLOOP=1: the section timers - the stream is synced at every chunk end, so all events
+        // are complete here
+        double host_sum = 0, gpu_sum = 0, host_max = 0, gpu_max = 0;
+        for (auto& s : m.hostloop) {
+            float el = 0;   // cudaEventElapsedTime takes a float*
+            cudaEventSynchronize(s.b);
+            cudaEventElapsedTime(&el, s.a, s.b);
+            host_sum += s.host_ms; gpu_sum += (double) el;
+            host_max = std::max(host_max, s.host_ms);
+            gpu_max = std::max(gpu_max, (double) el);
+            cudaEventDestroy(s.a);
+            cudaEventDestroy(s.b);
+        }
+        if (!m.hostloop.empty())
+            std::fprintf(stderr, "strata prefill hostloop: %zu expert sections, host %.0f ms, gpu span %.0f ms "
+                                 "(max section host %.1f / gpu %.1f ms)\n",
+                         m.hostloop.size(), host_sum, gpu_sum, host_max, gpu_max);
+        m.hostloop.clear();
     }
     return true;
 }

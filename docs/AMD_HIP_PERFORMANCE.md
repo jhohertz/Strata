@@ -143,3 +143,83 @@ Static 16K chunks, expanded FP16 expert tuning, and a 192-slot ring did not offe
 a consistent end-to-end win in the evaluated workload. The table includes only
 the selected 30 dense-shape rows. Microkernel speedups alone were not sufficient
 to select a configuration. No increase in GPU power cap was used.
+
+## gfx1103 (RDNA3 iGPU, Qwen3.8-Flash-Next GSQ-RCO Q2_0)
+
+First measured on the integrated gfx1103 APU (12 CU per KFD / 6 per the
+HIP runtime, 22.86 GiB GTT, 45 GiB RAM, ROCm 10.0.0~pre4, engine 0.1.29,
+branch `gfx1103`).  See `docs/GFX1103.md` for the machine record, the
+calibrated table (`tools/hip/gfx1103-hipblaslt-100401.txt`, 9 rows), and the
+known failure modes.  Configuration: `--mmap-experts --expert-cache 6000`
+(~7.72 GiB, explicit — never `auto`, which over-allocates off the
+HIP runtime's 22.86 GiB figure), `--prefill 512 --spec 4 --spec-min-p 0.5`,
+`--kv int8`, `--pool-workers 8`, greedy, tuned table via
+`STRATA_HIPBLASLT_TUNING`.
+
+One-shot generate mode (the `--serve` path needs the MTP draft-head GGUF,
+which was not in the model transfer):
+
+| Phase | Measured | Note |
+| --- | --- | --- |
+| Prefill, cold single chunk (44–73 tok) | 8.3–27.3 tok/s | first run after engine start streams 3.3k–4.5k experts from the CPU pool |
+| Prefill, warm batched (1,162–1,364 tok, 3 chunks) | **68.8 tok/s** | consistent across two separate passes |
+| Decode (`--spec 4`, suffix drafts) | 5.4–13.5 tok/s | greedy, 160-token replies; draft acceptance 0.21–0.49 |
+| Expert pool rows (CPU AVX2) | 12.9–42.7 GB/s | gate/up + down phases; 21–64 ms/round |
+
+Compared with the RX 7900 XTX (final revision: ~59 t/s decode, ~900 t/s
+prefill on the reference model), the iGPU is in the expected range for a
+shared-memory RDNA3 part: prefill is dominated by expert streaming from the
+CPU pool (the `--resident-cpu-experts` mode does not fit this box — the 23.9
+GiB complement exceeds available RAM), and decode is bound by the same pool
+round-trip plus the untuned bf16 dense GEMM (the tuned-table bf16 dense row
+returns NaN on this stack and is excluded by the accuracy gate — §9.10 in
+`docs/GFX1103.md`; f16 dense would get ~3.15× from the table).
+
+Smoke checks (4/4 PASS, `tools/hip/gfx1103_smoke.sh`): arithmetic 17×23+5 →
+396; executable one-line Python printing 1275 (`print(sum(range(1, 51)))`);
+system-marker recall; and a buried-fact recall at ~1,170-token batched
+prefill (724913).  `ple_parity` is excluded: its fixtures are part of the
+unpublished upstream suite.
+
+Engine 0.1.36 (2026-10-02, rebased branch, warm page cache, same configuration;
+the 0.1.31 era had no clean APU numbers - its runs faulted or hung):
+
+| Phase | 0.1.29 | 0.1.36 | Note |
+| --- | --- | --- | --- |
+| Prefill, warm batched (1,162 tok, 3 chunks) | 68.8 tok/s | **37.1 / 37.7 tok/s** (2 runs) | -46 % - a real regression on this APU; suspected the type-42 `kSplit` multi-token dequant/GU kernels (the 0.1.36 CUDA fused prompt path does not apply to HIP) and/or the new "prompt path borrows N cache slots" interaction; unconfirmed - `STRATA_OLD_IQ_MMVQ=1` A/B queued |
+| Prefill, cold single chunk (44–73 tok) | 8.3–27.3 tok/s | 9.6–14.6 tok/s (5 runs) | same spread |
+| Decode, longfill-follow (160 tok) | 13.5–13.6 tok/s | **19.4–19.5 tok/s** (2 runs) | +44 % |
+| Decode, short checks (160 tok) | 5.4–13.5 tok/s | 7.5–13.7 tok/s (5 runs) | same range |
+
+Power/thermal under the long prefill (0.5 s sampling, APU package sensors):
+package power peak **65.1 W** (mean 28.5), iGPU junction **58 °C**, CPU
+**62.4 °C** - the iGPU stays well inside its thermal envelope at this
+workload.  `amdgpu`'s `mem_info_vram_used` reports ~170 MiB throughout
+(the expert cache is GTT-mapped host memory, not counted there).
+
+Correctness on 0.1.36 is intermittent: of 9 engine runs in 40 minutes,
+7 passed the known-answer checks and 2 died with `unspecified launch
+failure` + `hipModuleUnload failed` (exit 1, self-terminating) - once in
+`iq_dequant_gu_f16` (longfill), once in `prefill copy_i32` (arithmetic).
+The fault site moves between runs, as in the 0.1.31 record
+(`docs/GFX1103.md` §11).  The numbers above are from the passing runs.
+
+A/B (post-reboot, 2026-09-30 01:31–01:33, warm page cache):
+
+| Arm | Prefill (1,162 tok / 44 tok) | Decode | Note |
+| --- | --- | --- | --- |
+| Tuned table (19:49 pass) | 68.8 tok/s | 13.5 tok/s | longfill, 160-token reply |
+| Tuned table (fresh 01:26 pass) | 68.6 tok/s | 13.6 tok/s | longfill, 160-token reply |
+| **Untuned (no table)** | 73.8 tok/s | 12.0 tok/s | longfill, 60-token reply |
+| **Pageable staging** (`STRATA_PAGEABLE_STAGING=1`) | 26.1 tok/s (44 tok) | 8.6 tok/s | no H2D failure; correct answer |
+
+Two conclusions: (1) **end-to-end prefill on this iGPU is expert-streaming
+bound** — CPU expert streaming is ~56% of the 3-chunk prefill wall time and
+varies ±2.7 s with page-cache temperature, so the tuned table's GEMM benefit
+(2.3–4.0× on f16 in microbenchmarks) does not move the end-to-end number
+here; the tuned-vs-untuned end-to-end delta (68.7 vs 73.8) is within the
+streaming spread. (2) **pageable staging is a validated fallback** for the
+APU's flaky pinned H2D (no failures, correct output); its speed delta is
+confounded by cache temperature, so no benefit is claimed.  A clean
+GEMM-phase A/B needs `bench_prefill.py` (serve path — blocked on the MTP
+head GGUF, `docs/GFX1103.md` §6.2).

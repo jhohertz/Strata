@@ -93,14 +93,30 @@ public:
     /// Plan v0.3 P6: slots of the given sizes, back to back (a native pack's blobs differ per layer, and a
     /// profile-filled tier never moves an expert to another layer's slot, so each slot keeps its first size).
     bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
-    /// Byte offset of each slot in the arena (null for uniform slots).
-    const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
+    /// igpu-rework (docs/IGPU.md): the ALIASING cache for integrated GPUs.  Every (layer, expert) owns a slot
+    /// whose contents are a 64-bit host pointer to the GTT-mapped blob instead of a copy of it: no arena, no
+    /// pinned staging, no memlock, no H2D copies - the kernels read the file mapping directly (P0 measured the
+    /// host read at the exact device-buffer rate, 82.6 GB/s).  `admit` fills the residency table as usual;
+    /// `set_aliased_pointers` uploads the pointers and proves the upload.
+    bool open_aliased(int64_t n_layers, int64_t n_expert, std::string& err);
+    /// Uploads the `slots()` 64-bit host pointers (slot order, i.e. `(layer, expert)` admission order) and
+    /// reads the table back to prove it.  One ~196 KiB copy for 24,576 experts is the whole "fill".
+    bool set_aliased_pointers(const uint64_t* host_pointers, std::string& err);
+    bool aliases() const { return alias_; }
+    /// Device table of per-slot host pointers (null unless `aliases()`).
+    const uint64_t* device_pointer_table() const { return d_ptrs_; }
+    /// Host mirror of the pointer table.  An alias cache's `slot_offsets()`, so a plan kernel that computes
+    /// `cache_base + slot_off[slot]` with `cache_base` null resolves to the host pointer itself.
+    const uint64_t* host_pointer_table() const { return h_ptrs_.empty() ? nullptr : h_ptrs_.data(); }
+    /// Byte offset of each slot in the arena (null for uniform slots; the pointer table for an alias cache).
+    const uint64_t* slot_offsets() const { return alias_ ? host_pointer_table() : (off_.empty() ? nullptr : off_.data()); }
     void close();
 
-    bool valid() const { return base_ != nullptr; }
+    bool valid() const { return alias_ || base_ != nullptr; }
     /// The slots usable now: all of them, unless `shrink` gave the tail's VRAM back (#533) - then the ones wholly
     /// inside the VRAM still backed, always a prefix.  The prompt path's loan (the last slots) and every report
-    /// follow this; `full_slots()` is what `open` allocated.
+    /// follow this; `full_slots()` is what `open` allocated.  (An alias cache never shrinks: every expert is
+    /// resident by construction.)
     int64_t slots() const { return live_slots_; }
     int64_t full_slots() const { return slots_; }
     /// Slots actually claimed.  Not the same as `slots()` - the cache does not evict, so a run that routes
@@ -227,6 +243,9 @@ private:
     std::vector<int64_t> seg_size_;     ///< #533: each segment's size (the last one may be shorter)
     int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
+    bool alias_ = false;              ///< igpu-rework: slots hold host pointers, not copies
+    std::vector<uint64_t> h_ptrs_;    ///< igpu-rework: host mirror, slot -> host pointer of the blob
+    uint64_t* d_ptrs_ = nullptr;      ///< igpu-rework: device table, slot -> host pointer of the blob
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
     int64_t n_layers_ = 0;

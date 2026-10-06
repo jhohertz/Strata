@@ -875,7 +875,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
             strata::kernels::quantize_q8_0_scaled(s.block.mixed, hits->x_q8, hits->x_scale, g.n_embd, (void*) cs);
             strata::kernels::moe_hit_grouped_s2_dev(hits->cache_base, hits->d_slot, hits->d_dst, hits->d_count, s.k,
                                                     hits->blob, hits->x_q8, hits->scratch, hits->hit_out, (void*) cs,
-                                                    hits->x_scale);
+                                                    hits->x_scale, hits->d_blob);
         }
         strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
         // A kernel, not a memcpy node: a copy-engine node splits the WDDM submission (measured 67 flushes/token).

@@ -61,3 +61,6 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# generated MTP runtime files (tools/generate_mtp_rt.py): local artifacts, not source
+/mtp-q2_0/
