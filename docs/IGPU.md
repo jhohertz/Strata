@@ -1682,3 +1682,27 @@ the middle holds at least 8 clean heavy engine sessions.**  The fault is not gon
 same driver race, and the micro's repeated register/unregister teardown is what spent the
 19:05 boot early - but a normal experimental boot has a usable budget.  State at stop: clean,
 no hung process, a normal shutdown (ErP deep sleep) is safe.
+
+## P2.13: the dense bf16 projections ran 2.4-7.3x slower than their best BLAS solution - tuned, +3% prefill
+
+Fresh-boot profile of the 33.4 s prompt (STRATA_PREFILL_TIMING, 1162 tokens): the non-expert
+7.6 s is hc/hyper-connection reads 1.59 s (per layer, 2 halves x norm + down 10240->320 + silu
++ up 320->10240 + inject 4->10240, D=10240 channels), gdn projections 1.64, qsa proj 1.23,
+gdn out proj 1.15, qsa attn 0.60, router 0.62, recurrence 0.36, combine 0.19.  The experts are
+26.4 s (dequant/gather 8.8, gemm gu 12.8, gemm dn 4.7) - 80%.
+
+The hc/router gemms go through `bf16_proj` (hipBLASLt bf16); the qkv/gate/ssm_out gemms go
+through `gm.native` (the native GGUF blocks dequantized to an f16 scratch each call, then an
+f16 BLAS gemm - the f16 shapes were already tuned).  The bf16 dense shapes were NOT in the
+tuning file: `tune_hipblaslt --case bf16,512,N,K,ldy` shows hipBLASLt's default heuristic
+picking algorithms 2.36x-7.33x slower than the best candidate for every one of them
+(qkv-shape 10240x2560: 22.3 -> 4.08 ms, 5.5x; gate 6144x2560: 6.1x; ssm_out 2560x6144: 7.3x;
+router/indexer-q 512x2560: 3.6x; indexer-k 128x2560: 4.5x; hc-up 10240x320: 2.4x; hc-inject
+10240x4: best candidate is 0.94x, so it stays on the default).  Added the six winning rows
+(bucket 512 covers the 512/138 chunks): hc read 1593 -> 893 ms, router 616 -> 523, prefill
+34.1 -> 33.1 s (34.9 -> 35.1 tok/s), arithmetic smoke still 396.  The gdn/qsa-proj/gdn-out
+phases did NOT move (they are the `gm.native` f16 path, already tuned) - their wall is the
+f16 gemm FLOPs plus the per-call W dequant.  Caching the dequantized W across the 3 chunks
+would need ~5.5 GiB of per-layer f16 slots - it does not fit the 8 GiB carve (it would fit
+the 16 GiB config), so on this box the remaining dense lever is a fused dequant+gemm kernel,
+same family as the expert gemm work.
