@@ -4166,7 +4166,14 @@ int main(int argc, char** argv) {
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
-        if (pf_borrow && d_res != nullptr) {
+        // igpu-rework: an alias cache holds the expert DATA itself in the region its slots name (the GTT-mapped
+        // host complement) - there is no spare arena to carve the prompt's buffers from, and the loan's refill
+        // could not restore what the carve overwrote (docs/IGPU.md P2.14: the 74-token prompt bug).  The prompt
+        // path takes its own buffers, exactly as the one-shot path already does.
+        if (xcache.aliases() && (pf_borrow || d_res != nullptr))
+            std::fprintf(stderr, "strata serve: the alias cache holds the expert data itself: the prompt path uses "
+                                 "its own buffers (nothing is lent)\n");
+        if (pf_borrow && d_res != nullptr && !xcache.aliases()) {
             pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
             for (auto& st : stages)
                 pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});

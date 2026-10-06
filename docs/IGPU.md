@@ -1706,3 +1706,54 @@ f16 gemm FLOPs plus the per-call W dequant.  Caching the dequantized W across th
 would need ~5.5 GiB of per-layer f16 slots - it does not fit the 8 GiB carve (it would fit
 the 16 GiB config), so on this box the remaining dense lever is a fused dequant+gemm kernel,
 same family as the expert gemm work.
+
+## P2.14: the OpenAI/Anthropic server - one prompt failed 4/4, and it was the alias cache's loan arithmetic
+
+The serve path (serve/server.py + the engine's `--serve` loop) was untested: the one-shot
+path had all of P1/P2, but nothing had ever sent a request through the loop.  First attempt
+answered ("396", decode 16-17 tok/s, drafts accepted 82%), then one prompt failed
+deterministically - "Write one line of Python that prints the sum of the integers 1 through
+50" -> `prefill: routed id out of range`, 4/4 repeats, while two other prompts (arithmetic,
+a marker phrase) passed.  The engine exits after a failed request and the server restarts
+it per request, so every "passing" request ran on a fresh engine: the failure was prompt-
+specific, not process state.
+
+The engine alone reproduces it (a `GEN <ids>` line piped into `strata --serve`, no Python).
+Instrumenting the router guard: at layer 0 the whole T x K routed-id table is garbage, the
+router's logits are zero, and its input (the hyper-connection mix of the layer-0 hidden
+state) is zero - while the embedding, read moments earlier, is healthy (8152 nonzero in
+row 0).  Poisoning the residual buffer with an index pattern after the embedding broadcast
+and re-reading it at the router: **the entire 2.98 MB buffer has been zeroed**, cleanly,
+from element 0.  Section-by-section syncs around layer 0 put the overwrite in the GDN
+section; per-step syncs put the first reported error on the very first GDN GEMM's
+dequant; and the kernel log names the fault: a write at scratch+1.32 MB,
+`PERMISSION_FAULTS: 0x5` (page not present) - the first write past the end of the mapped
+region (the expert blob there is 1.38 MB).
+
+The prompt path's buffers in serve mode are not allocated: they are **borrowed** from the
+end of the expert cache - the loan math (`part_slots`/`part_bytes`) was written for
+sized-slot caches, whose `slot_offsets()` is an (n+1)-entry array of byte offsets (the
+last entry is the total).  The alias cache (P1) returns its n-entry **host-pointer table**
+from the same accessor: the loop reads one entry past the end (0), `part_slots` returns 1
+unconditionally, and `part_bytes` computes `bytes() - <host VA>` - a wrapped 1.8e19.  The
+"16 GiB loan" is thus the region **starting at the last expert blob and ending nowhere**:
+the carve lays the 64 MB dequant scratch, the BLAS workspace, the token buffers and the
+streaming ring on top of the last expert and ~400 MB past the end of the 31.64 GiB
+complement.  The dequant's first 1.38 MB silently overwrites the last expert blob; its
+next write is the IMA; and the residual/ids buffers that live past the complement's end
+read back as whatever the fault left there (zeros).  Whether the out-of-range write hits a
+mapped or an unmapped page depends on what the ASLR happened to put there - which is why
+other prompts sometimes got through with the last expert's data quietly destroyed (the
+silent "plausible tokens" mode the loan code warns about).  The one-shot path was already
+guarded in P1 (`!xcache.aliases()` - "no cache slots to borrow"); the serve path was not,
+because nothing had exercised it.
+
+The fix is the one-line guard on the serve loan planning: an alias cache holds the expert
+**data** in the region its slots name, so there is nothing to lend and the prompt path
+takes its own buffers (a log line says so at start).  Verified on this box: the 74-token
+prompt that failed 4/4 now answers `print(sum(range(1, 51)))` (drafts 47/56); arithmetic
+"396" with the checkpoint machinery working (69 tokens = 64 reused + 5 read); and a
+1425-token prompt read in three 512-token chunks at 38.5 tok/s with a correct summary.
+The serve config (strata-igpu-serve.json) and the launch script (tools/hip/igpu_serve_boot.sh)
+commit with this; the MTP runtime files (mtp-q2_0/rt, dense.bin + experts.bin) are
+generated, not committed: `python3 tools/mtp_rt.py --gguf <mtp-q2_0.gguf> --out mtp-q2_0/rt`.
