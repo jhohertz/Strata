@@ -3,7 +3,7 @@
 #
 # Protocol (post-BIOS, docs/IGPU.md P2.14): run unless there is EVIDENCE of a bad driver
 # state - not "only on a fresh boot".  The gate is the arithmetic canary plus the journal
-# fault lines; the BIOS changeset (P2.11) extended the boot budget to 8-11+ clean
+# fault lines; the BIOS changeset (P2.11) held 41 clean lifecycles on the 2026-10-05 boot (P2.14), and
 # userptr lifecycles and the canary catches the silent-corruption stage before it matters.
 # Steps: boot health check -> arithmetic canary -> start the server (nohup, never killed by
 # this script) -> wait for READY -> one API request.

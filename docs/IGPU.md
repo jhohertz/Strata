@@ -1782,3 +1782,11 @@ The serve config is a local file (strata-*.json is gitignored); on this box it i
 back to a mock engine; the port is whatever the server finds free - it reports the
 URL it bound in its READY line.  `--spec 4` is the MTP draft head's speculation, and
 `--mtp mtp-q2_0/rt` the runtime files it reads.)
+
+The debugging session ran forty-one full userptr-lifecycle equivalents on the 20:31 boot
+(the canary, the one-shot reproductions, the serve-direct bisection, the server requests -
+each engine process does the 31.64 GiB register -> DMA -> run -> unregister) and the whole-
+boot fault indicators stayed at zero.  That is five times the "at least 8" measured in
+P2.12d under the same no-micro rule - on this boot the BIOS changeset's effect looks like
+more than a budget extension, though the protocol is unchanged: the fault is a driver
+race, the budget is empirical, and an AC cut remains the only reset from a faulted state.
