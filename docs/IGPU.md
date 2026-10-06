@@ -1664,3 +1664,21 @@ the big micro runs out of the middle.
 State after this boot: the machine is faulted with a hung process - **AC-cut power cycle
 (unplug/PSU switch + hold the power button ~10 s), not a normal shutdown** (P2.9e: shutting
 down from a faulted state may carry MES state across the power-off).
+
+## P2.12d: the no-micro boot holds 8 clean session-equivalents (20:31 boot)
+
+AC-cut power cycle after the 19:05 fault, fresh boot 20:31 (iommu on, 8 GiB carve,
+MemAvailable 51.8 GiB at start).  Canary clean (396), then **seven longfills, all clean**:
+34.9 / 34.9 / 34.8 / 34.9 / 34.9 / 34.6 / 34.9 tok/s, no degradation across the boot.  The
+whole-boot fault indicators are all zero — `restore_userptr_worker`: 0, `MES failed`: 0,
+`Failed to evict`: 0 (the only MES lines are the normal boot-time `vmid_mask`/`gfx_hqd_mask`
+init at 20:31:32).
+
+Eight full userptr-lifecycle equivalents (the canary and every longfill each do the 31.64 GiB
+complement's register -> DMA -> the run -> unregister), no micro interleaved, and the machine
+is still clean.  That is beyond the 6-7 estimate from P2.12c and more than double the old
+era's 4-5.  The working rule now, measured: **a boot with no 31 GiB micro register cycles in
+the middle holds at least 8 clean heavy engine sessions.**  The fault is not gone - it is the
+same driver race, and the micro's repeated register/unregister teardown is what spent the
+19:05 boot early - but a normal experimental boot has a usable budget.  State at stop: clean,
+no hung process, a normal shutdown (ErP deep sleep) is safe.
