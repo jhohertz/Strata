@@ -1757,3 +1757,28 @@ prompt that failed 4/4 now answers `print(sum(range(1, 51)))` (drafts 47/56); ar
 The serve config (strata-igpu-serve.json) and the launch script (tools/hip/igpu_serve_boot.sh)
 commit with this; the MTP runtime files (mtp-q2_0/rt, dense.bin + experts.bin) are
 generated, not committed: `python3 tools/mtp_rt.py --gguf <mtp-q2_0.gguf> --out mtp-q2_0/rt`.
+
+The serve config is a local file (strata-*.json is gitignored); on this box it is:
+
+    {
+      "exe": "./build-hip/strata",
+      "args": ["--serve", "--pack", "packs/qwen38-flash-next-q2_0",
+               "--native", "/home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+               "--ple-gguf", "/home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf",
+               "--mmap-experts", "--expert-profile", "data/expert-profile.bin",
+               "--expert-cache", "6000", "--prefill", "512", "--spec", "4",
+               "--spec-min-p", "0.5", "--mtp", "mtp-q2_0/rt",
+               "--max-context", "4096", "--pool-workers", "8",
+               "--adapt-every", "0", "--pcie-frac", "0", "--vram-reserve-mib", "1024"],
+      "env": {"STRATA_IGPU_ALIAS": "1", "STRATA_GROUP_COPY": "1", "STRATA_SSD_KEEPALIVE": "0",
+              "STRATA_HIPBLASLT_WARMUP": "1", "STRATA_HIPBLASLT_TUNING": "$PWD/tools/hip/gfx1103-hipblaslt-100401.txt"},
+      "tokenizer": "packs/qwen38-flash-next-q2_0/tokenizer",
+      "port": 8095,
+      "model_name": "qwen38-flash-next-q2_0",
+      "context": 4096
+    }
+
+(the engine needs `--engine strata` on the server command line, or the server falls
+back to a mock engine; the port is whatever the server finds free - it reports the
+URL it bound in its READY line.  `--spec 4` is the MTP draft head's speculation, and
+`--mtp mtp-q2_0/rt` the runtime files it reads.)
