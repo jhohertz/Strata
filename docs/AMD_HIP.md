@@ -125,9 +125,11 @@ cmake -S . -B build-hip \
 cmake --build build-hip --target strata -j2
 ```
 
-`CMAKE_HIP_ARCHITECTURES` is `gfx1100`, `gfx1101`, `gfx1200`, `gfx1201`, or a list such as `"gfx1100;gfx1201"`
-(one binary for both). gfx1102 (the same wave32, 64 KiB LDS and dot4 instruction) builds with a warning: it passed
-ctest (#192) but no model run has been reported; so does gfx1030 (RDNA2: the older `v_dot4_i32_i8`, a community run in #311). At startup the engine and `strata-device` compare each GPU they use
+`CMAKE_HIP_ARCHITECTURES` is `gfx1100`, `gfx1101`, `gfx1103`, `gfx1200`, `gfx1201`, or a list such as
+`"gfx1100;gfx1201"` (one binary for both). gfx1102 (the same wave32, 64 KiB LDS and dot4 instruction) builds with
+a warning: it passed ctest (#192) but no model run has been reported; so does gfx1030 (RDNA2: the older
+`v_dot4_i32_i8`, a community run in #311) and gfx1151 (the RDNA3.5 APU: the same wave32, LDS limit and dot4
+instruction as RDNA3, not yet run on a card - report results). At startup the engine and `strata-device` compare each GPU they use
 (`gcnArchName` up to the `:` feature suffix) with the architectures the binary was compiled for, and require
 wave32. A binary carried to another card stops with the card's name, its architecture and the build's list,
 instead of failing later with "invalid device function".
