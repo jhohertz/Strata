@@ -905,13 +905,12 @@ void FileExpertSource::close() {
         if (!complement_chunks_.empty()) {
             for (void* p : complement_chunks_) (void) cudaHostUnregister(p);
             std::free(complement_arena_);
+        } else if (complement_pinned_ && !complement_registered_) {
+            (void) cudaFreeHost(complement_arena_);   // cudaHostAlloc's own release - do not free it again
         } else {
-            if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
-            else {
-                if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
-                if (gpu_register_bytes_ > 0)
-                    (void) cudaHostUnregister((uint8_t*) complement_arena_ + gpu_register_off_);
-            }
+            if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
+            if (gpu_register_bytes_ > 0)
+                (void) cudaHostUnregister((uint8_t*) complement_arena_ + gpu_register_off_);
             if (complement_locked_ > 0)
                 strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
             std::free(complement_arena_);
