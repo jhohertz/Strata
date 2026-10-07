@@ -1858,3 +1858,22 @@ it was present on clean boots too (the 17:28 arithmetic run answered 396 correct
 then looped) - and does not invalidate the timing numbers, only the acceptance
 numbers, because the loop rounds are real rounds the draft head mispredicts.
 Judge the canary by the answer, not by the tail.
+
+## P2.15: the dp4a wall, quantified (Oct 6, fresh boot, device-only arms, zero fault lines)
+
+| micro arm | what it measures | result |
+| --- | --- | --- |
+| `--dp4a 4 pinned` | read Q2_0 blocks at the full GTT rate, one dp4a per 4-byte word | 82.6 GB/s, 147 GFLOPS |
+| `--dp4a-peak 512 200000` | the same inner loop in registers, no memory at all | **4660 GFLOPS** |
+
+The 147 is the read-bound floor for Q2_0 (32 FLOP per 18-byte block x 82.6 GB/s), not the peak -
+the engine's gemm phase (280-380 GFLOPS, each blob reused across ~14 tokens per row-group) already
+sits above it, so the engine is compute-bound: **6-8% of the measured dp4a peak**. The dequant
+phase's 8.8 s is the 7x write amplification (64 fp16 values written per 18-byte block read) at
+~50 GB/s combined - overhead the fused path avoids, which then pays the compute wall instead.
+P2.7's "every expert path lands at ~39 tok/s" is these two paths meeting the same wall from
+opposite sides.
+
+The lever, with a number attached: an RDNA3-shaped tile that reaches 30-40% of the 4.66 TFLOPS
+peak puts the expert phase at ~3-4 s instead of 17.9 s, and prefill at ~100 tok/s. The next test
+is the tile itself: `STRATA_PF_BK64` / the 128x256 64-k tile kernel, untested on gfx1103.

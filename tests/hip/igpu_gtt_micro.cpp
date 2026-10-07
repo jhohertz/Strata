@@ -610,6 +610,120 @@ int run_dequant_arm(long long gib, bool nb, long long pressure_gib, bool thp, bo
     return 0;
 }
 
+// igpu-rework P2.15: the fused path's ceiling.  The engine's two expert paths meet at the same
+// ~39 tok/s wall from opposite sides: the dequant+BLAS path pays a 7x write amplification (64
+// fp16 values written per 18-byte Q2_0 block read) at ~50 GB/s combined, and the fused dp4a path
+// reads without amplification but computes at ~152 GFLOPS.  This arm reads the same blocks through
+// the engine's mapping and does one dp4a per 4-byte code word - no LDS, no dequantized writes, no
+// per-expert launch rhythm - so the number it prints is the pure dp4a ceiling: near the emulated
+// peak (~3.6 TFLOPS) means the engine's 152 GFLOPS is the tile shape; near 150-300 GFLOPS means
+// the dp4a emulation itself is the wall and the fused path cannot beat the dequant path here.
+__global__ void dp4a_ceiling_kernel(const uint8_t* __restrict__ blocks, long long nblocks, uint32_t* partials) {
+    const int64_t lane = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t a0 = 0x01020304u + threadIdx.x, a1 = 0x05060708u + threadIdx.x;
+    const uint32_t a2 = 0x090a0b0cu + threadIdx.x, a3 = 0x0d0e0f10u + threadIdx.x;
+    int64_t acc = 0;
+    for (int64_t b = lane; b < nblocks; b += (int64_t) gridDim.x * blockDim.x) {
+        const uint8_t* p = blocks + b * 18;   // type 42: 16 code bytes + 2 scale bytes per 64 values
+        uint32_t w0, w1, w2, w3;
+        __builtin_memcpy(&w0, p, 4); __builtin_memcpy(&w1, p + 4, 4);
+        __builtin_memcpy(&w2, p + 8, 4); __builtin_memcpy(&w3, p + 12, 4);
+        acc += __dp4a(w0, a0, 0) + __dp4a(w1, a1, 0) + __dp4a(w2, a2, 0) + __dp4a(w3, a3, 0);
+    }
+    if (acc < 0) acc = -acc;
+    atomicAdd(&partials[blockIdx.x], (uint32_t) acc);
+}
+
+// igpu-rework P2.15b: the compute-bound dp4a peak.  The --dp4a arm above is read-bound: Q2_0
+// fixes 32 FLOP per 18-byte block, so at the full 82.6 GB/s read it cannot exceed 147 GFLOPS -
+// that number is the floor, not the peak, and the engine's gemm (280-380 GFLOPS, blobs reused
+// across ~14 tokens per row-group) already sits above it.  This arm keeps the codes in registers
+// (no host read at all) and runs the same dp4a inner loop: whatever it prints is the pure dp4a
+// peak for this APU, and the engine's 300 GFLOPS is a percentage of it.  If the peak is ~4
+// TFLOPS (native or lightly emulated dp4a), the tile shape has a 10x headroom; if it is ~500
+// GFLOPS, the engine is already near the wall and the expert phase cannot move much.
+__global__ void dp4a_peak_kernel(uint32_t seed, long long iters, uint32_t* partials) {
+    const uint32_t a0 = seed + threadIdx.x, a1 = seed + threadIdx.x * 3u, a2 = seed + threadIdx.x * 5u,
+                   a3 = seed + threadIdx.x * 7u;
+    uint32_t acc = 0;
+    for (long long i = 0; i < iters; ++i) {
+        const uint32_t w0 = (uint32_t) (i * 2654435761u) ^ a0, w1 = (uint32_t) (i * 40503u) ^ a1;
+        const uint32_t w2 = (uint32_t) (i * 2246822519u) ^ a2, w3 = (uint32_t) (i * 3266489917u) ^ a3;
+        acc += __dp4a(w0, a0, 0) + __dp4a(w1, a1, 0) + __dp4a(w2, a2, 0) + __dp4a(w3, a3, 0);
+    }
+    atomicAdd(&partials[blockIdx.x], acc);
+}
+
+int run_dp4a_peak_arm(int blocks, long long iters) {
+    uint32_t* d_partials = nullptr;
+    CHECK(hipMalloc(&d_partials, (size_t) blocks * sizeof(uint32_t)));
+    CHECK(hipMemsetAsync(d_partials, 0, (size_t) blocks * sizeof(uint32_t), 0));
+    dp4a_peak_kernel<<<blocks, 256, 0, (hipStream_t) 0>>>(0x5a5a5a5au, iters, d_partials);
+    CHECK(hipGetLastError());
+    CHECK(hipDeviceSynchronize());   // warm the launch; the timed pass follows
+    const auto t0 = std::chrono::steady_clock::now();
+    dp4a_peak_kernel<<<blocks, 256, 0, (hipStream_t) 0>>>(0x5a5a5a5au, iters, d_partials);
+    CHECK(hipStreamSynchronize(0));
+    const long long ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    const double dp4a_count = (double) blocks * 256.0 * (double) iters * 4.0;
+    std::printf("igpu_gtt_micro: dp4a peak arm: %d blocks x 256 threads x %lld x 4 dp4a in %lld ms: %.0f GFLOPS\n",
+                blocks, iters, ms, dp4a_count * 8.0 / 1e9 / (ms / 1000.0));
+    CHECK(hipFree(d_partials));
+    return 0;
+}
+
+int run_dp4a_arm(long long gib, bool pinned) {
+    const long long bytes = gib * (1ll << 30);
+    uint8_t* host = nullptr;
+    const bool host_pinned_alloc = pinned;
+    if (pinned) {
+        const hipError_t e = hipHostAlloc((void**) &host, (size_t) bytes, hipHostAllocMapped | hipHostAllocPortable);
+        if (e != hipSuccess || host == nullptr) {
+            std::fprintf(stderr, "igpu_gtt_micro: dp4a arm: cudaHostAlloc %lld GiB: %s\n", gib, hipGetErrorString(e));
+            return 2;
+        }
+    } else {
+        host = (uint8_t*) std::malloc(bytes);
+        if (!host) { std::fprintf(stderr, "igpu_gtt_micro: dp4a arm: cannot allocate %lld GiB\n", gib); return 2; }
+    }
+    for (long long off = 0; off < bytes; off += 4096)
+        std::memset(host + off, (int) (((off >> 12) & 0xff) ^ 0x5a), 4096);
+    if (!host_pinned_alloc && hipHostRegister(host, (size_t) bytes, hipHostRegisterDefault) != hipSuccess) {
+        std::fprintf(stderr, "igpu_gtt_micro: dp4a arm: register: %s\n", hipGetErrorString(hipGetLastError()));
+        return 2;
+    }
+    void* alias = nullptr;
+    CHECK(hipHostGetDevicePointer(&alias, host, 0));
+    const int kBlocks = 512;
+    uint32_t* d_partials = nullptr;
+    uint8_t* d_ping = nullptr;
+    CHECK(hipMalloc(&d_partials, kBlocks * sizeof(uint32_t)));
+    CHECK(hipMalloc(&d_ping, 4 << 20));
+    // the engine's prefault: one full DMA pass before the first kernel read (the passing model)
+    const size_t chunk = 4ull << 20;
+    for (long long off = 0; off < bytes; off += chunk)
+        CHECK(hipMemcpy(d_ping, host + off, (size_t) std::min<long long>(chunk, bytes - off), hipMemcpyHostToDevice));
+    CHECK(hipDeviceSynchronize());
+    const long long nblocks = bytes / 18;
+    CHECK(hipMemsetAsync(d_partials, 0, kBlocks * sizeof(uint32_t), 0));
+    const auto t0 = std::chrono::steady_clock::now();
+    dp4a_ceiling_kernel<<<kBlocks, 256, 0, (hipStream_t) 0>>>((const uint8_t*) alias, nblocks, d_partials);
+    CHECK(hipGetLastError());
+    CHECK(hipStreamSynchronize(0));
+    const long long ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    const double flops = (double) nblocks * 32.0 / 1e9 / (ms / 1000.0);   // 16 MACs x 2 per block
+    std::printf("igpu_gtt_micro: dp4a arm: %lld GiB %s read in %lld ms: %.1f GB/s, %.0f GFLOPS dp4a\n",
+                gib, host_pinned_alloc ? "pinned" : "registered", ms,
+                (double) bytes / 1e9 / (ms / 1000.0), flops);
+    CHECK(hipFree(d_partials));
+    CHECK(hipFree(d_ping));
+    if (host_pinned_alloc) (void) hipFreeHost(host);
+    else { (void) hipHostUnregister(host); free(host); }
+    return 0;
+}
+
 
 // igpu-rework P2.4: the engine's gather phase, in a process without the engine.  The 0.1.36 alias
 // profile's "dequant" phase (8.0 s, 26 %) actually contains the MMQ-on gather: per expert, one
@@ -839,6 +953,14 @@ int main(int argc, char** argv) {
             return run_scatter_arm((long long) std::atof(argv[i + 1]));
         if (std::strcmp(argv[i], "--alias") == 0 && i + 1 < argc)
             return run_alias_arm((long long) std::atof(argv[i + 1]));
+        if (std::strcmp(argv[i], "--dp4a-peak") == 0 && i + 2 < argc)
+            return run_dp4a_peak_arm(std::atoi(argv[i + 1]), (long long) std::atof(argv[i + 2]));
+        if (std::strcmp(argv[i], "--dp4a") == 0 && i + 1 < argc) {
+            bool pinned = false;
+            int j = i + 2;
+            while (j < argc) { if (std::strcmp(argv[j], "pinned") == 0) pinned = true; ++j; }
+            return run_dp4a_arm((long long) std::atof(argv[i + 1]), pinned);
+        }
         if (std::strcmp(argv[i], "--dequant") == 0 && i + 1 < argc) {
             bool nb = false, thp = false, dev = false, pinned = false;
             long long pressure = 0;
