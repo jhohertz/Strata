@@ -1827,3 +1827,14 @@ complement, the alias table fell back to the file mapping, and every run died on
 illegal memory access at the first expert read (the file-backed VMA faults on this
 iGPU, P1).  The fix is operational, not code: stop the old server before starting the
 engine you are about to measure.
+
+One comparison this session could not finish: the 0.1.36 one-shot decode was
+18.8-20.5 tok/s, the 0.1.40 longfill above 14.97.  The two upstream commits that
+touch the decode expert kernels both ship A/B toggles (`STRATA_OLD_GROUPED=1`
+reselects the pre-e155b07 Q2_0 grouped and per-hit kernels; `STRATA_S2_SWIGLU_Q8=0`
+keeps the pre-3281ac3 two-launch SwiGLU+quantize), so a fresh boot needs only a
+canary plus three short decode runs to attribute the gap.  On the 20:31 boot the
+attempt was inconclusive - by 17:30 the canary prompt had started repeating a
+token (the spent-boot signal, 47 clean + 4 failed lifecycles that boot), and all
+three variants ran at 9.0 tok/s in the repetition, which measures the spent boot,
+not the kernels.
