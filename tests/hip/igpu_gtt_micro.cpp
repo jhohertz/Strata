@@ -738,15 +738,15 @@ constexpr int H = 2560, GMAX = 8, ROW_GU = H / 4;
 // GFLOPS printed is model FLOPs (64 per chunk per entry), comparable with the engine's phase time.
 // Variants: the engine's default (word-major LDS, 32 rows per block), the pre-e155b07 byte-major
 // layout, more rows per block, and occupancy changes.
-template <int ROWS, bool WORD_MAJOR, int BLOCK>
+template <int ROWS, bool WORD_MAJOR, int BLOCK, int ENT>
 __global__ void __launch_bounds__(BLOCK) tile_kernel(const uint8_t* __restrict__ blobs, int n_groups,
                                                       long long reps, uint32_t* partials) {
     constexpr int NC = H / 32;                 // 80 chunks per gate/up row
     constexpr int CHUNKS = (NC + 31) / 32;     // chunks per lane
-    __shared__ int xs[GMAX * NC * 8];          // the entries' activations as words (8 per chunk)
+    __shared__ int xs[ENT * NC * 8];          // the entries' activations as words (8 per chunk)
     const int g = (int) blockIdx.x % n_groups;
     const uint8_t* blob = blobs + (size_t) g * 1382400;
-    for (int i = threadIdx.x; i < GMAX * NC; i += BLOCK) {
+    for (int i = threadIdx.x; i < ENT * NC; i += BLOCK) {
         const int k = i / NC, c = i % NC;
         for (int w = 0; w < 8; ++w)
             xs[WORD_MAJOR ? (w * GMAX * NC + k * NC + c) : (k * NC * 8 + c * 8 + w)] =
@@ -757,19 +757,26 @@ __global__ void __launch_bounds__(BLOCK) tile_kernel(const uint8_t* __restrict__
     const int ones = 0x01010101;
     int acc = 0;
     for (long long rep = 0; rep < reps; ++rep) {
+        // cold: each rep walks a different set of blobs, so the shape is measured on reads that actually
+        // come from memory instead of a 20 KB per-block working set that stays in CU cache.
+        const uint8_t* blobr = blobs + (size_t) (((long long) blockIdx.x + rep * gridDim.x) % n_groups) * 1382400;
         for (int rr = warp; rr < ROWS; rr += BLOCK / 32) {
-            const uint8_t* codes = blob + (size_t) rr * ROW_GU;
+            const uint8_t* codes = blobr + (size_t) rr * ROW_GU;
             for (int q = 0; q < CHUNKS; ++q) {
                 const int c = lane + 32 * q;
                 if (c >= NC) break;
-                uint2 cb = *(const uint2*) (codes + (size_t) c * 8);
+                // volatile: the blob is const and never written, so without this the compiler hoists the
+                // loads out of the rep loop and the arm measures compute on register-resident data, not the
+                // memory-bound rate the engine actually sees.
+                const volatile unsigned* vw = (const volatile unsigned*) (codes + (size_t) c * 8);
+                uint2 cb; cb.x = vw[0]; cb.y = vw[1];
                 const uint8_t* cbytes = (const uint8_t*) &cb;
-                for (int k = 0; k < GMAX; ++k) {
+                for (int k = 0; k < ENT; ++k) {
                     for (int j = 0; j < 8; ++j) {
                         const unsigned cbyte = cbytes[j];
                         const int cw = (int) ((cbyte & 3u) | (((cbyte >> 2) & 3u) << 8) |
                                               (((cbyte >> 4) & 3u) << 16) | (((cbyte >> 6) & 3u) << 24));
-                        const int idx = WORD_MAJOR ? (j * GMAX * NC + k * NC + c) : (k * NC * 8 + c * 8 + j);
+                        const int idx = WORD_MAJOR ? (j * ENT * NC + k * NC + c) : (k * NC * 8 + c * 8 + j);
                         acc += __dp4a(cw, xs[idx], 0) + __dp4a(ones, xs[idx], 0);
                     }
                 }
@@ -792,28 +799,39 @@ int run_tile_arm(long long gib) {
     CHECK(hipMalloc(&d_partials, 512 * sizeof(uint32_t)));
     const long long reps = 200;
     const int kBlocks = 512;   // 16 blocks per CU on 32 CUs
-    struct Variant { const char* name; int rows; bool word_major; int block; };
+    struct Variant { const char* name; int rows; bool word_major; int block; int ent; };
     const Variant vars[] = {
         {"engine default (word-major, 32 rows, 256 thr)", 32, true,  256},
         {"byte-major (pre-e155b07, 32 rows, 256 thr)    ", 32, false, 256},
         {"word-major, 64 rows, 256 thr                  ", 64, true,  256},
         {"word-major, 32 rows, 512 thr                  ", 32, true,  512},
         {"word-major, 16 rows, 128 thr                  ", 16, true,  128},
+        {"engine shape, 4 entries per group              ", 32, true, 256, 4},
+        {"engine shape, 2 entries per group              ", 32, true, 256, 2},
+        {"engine shape, 1 entry per group (decode)       ", 32, true, 256, 1},
+        {"8 rows, 256 thr, 1 entry                       ", 8,  true, 256, 1},
+        {"4 rows, 128 thr, 1 entry                       ", 4,  true, 128, 1},
     };
     for (const auto& v : vars) {
         CHECK(hipMemsetAsync(d_partials, 0, 512 * sizeof(uint32_t), 0));
         auto launch = [&]() {
-            if (v.word_major && v.rows == 32 && v.block == 256) tile_kernel<32, true, 256><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
-            else if (v.word_major && v.rows == 64 && v.block == 256) tile_kernel<64, true, 256><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
-            else if (v.word_major && v.rows == 16 && v.block == 128) tile_kernel<16, true, 128><<<kBlocks, 128, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
-            else tile_kernel<32, false, 256><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            if (v.ent == 4) tile_kernel<32, true, 256, 4><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.ent == 2) tile_kernel<32, true, 256, 2><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.ent == 1 && v.rows == 8) tile_kernel<8, true, 256, 1><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.ent == 1 && v.rows == 4) tile_kernel<4, true, 128, 1><<<kBlocks, 128, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.ent == 1) tile_kernel<32, true, 256, 1><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.word_major && v.rows == 32 && v.block == 256) tile_kernel<32, true, 256, 8><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.word_major && v.rows == 64 && v.block == 256) tile_kernel<64, true, 256, 8><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.word_major && v.rows == 16 && v.block == 128) tile_kernel<16, true, 128, 8><<<kBlocks, 128, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else tile_kernel<32, false, 256, 8><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
         };
         launch(); CHECK(hipGetLastError()); CHECK(hipDeviceSynchronize());   // warm
         const auto t0 = std::chrono::steady_clock::now();
         launch();
         CHECK(hipStreamSynchronize(0));
         const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-        const double flops = (double) kBlocks * (double) v.rows * GMAX * (H / 32) * 64.0 * (double) reps / 1e9 / (ms / 1000.0);
+        const int ent = v.ent ? v.ent : GMAX;
+        const double flops = (double) kBlocks * (double) v.rows * ent * (H / 32) * 64.0 * (double) reps / 1e9 / (ms / 1000.0);
         std::printf("igpu_gtt_micro: tile arm: %s  %6.0f GFLOPS\n", v.name, flops);
     }
     CHECK(hipFree(d_partials));
