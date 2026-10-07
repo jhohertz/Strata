@@ -1877,3 +1877,9 @@ opposite sides.
 The lever, with a number attached: an RDNA3-shaped tile that reaches 30-40% of the 4.66 TFLOPS
 peak puts the expert phase at ~3-4 s instead of 17.9 s, and prefill at ~100 tok/s. The next test
 is the tile itself: `STRATA_PF_BK64` / the 128x256 64-k tile kernel, untested on gfx1103.
+
+Two env levers tried on the same boot (longfill, timing on): `STRATA_PF_GEMM=1` refuses this
+pack's shapes (the padded-X case needs the PF_PAD path, unsupported for the i-quant dense
+tensors), and `STRATA_WMMA_GEMM=1` is flat - 34.7 vs 34.65 tok/s.  The dense phase is already
+near hardware; the expert gemm has no env knob - its tile is compile-time constants, so the
+6-8%-of-peak gap is a code change, not a setting.
