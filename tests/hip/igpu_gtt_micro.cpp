@@ -725,6 +725,103 @@ int run_dp4a_arm(long long gib, bool pinned) {
 }
 
 
+// Constants mirrored from src/kernels/cuda/s2_expert_grouped.cu (the engine's geometry).
+constexpr int H = 2560, GMAX = 8, ROW_GU = H / 4;
+
+// igpu-rework P2.16: the tile search.  The engine's grouped gate/up pattern on DEVICE memory
+// (blobs copied once, no host read), so the number printed is the kernel shape alone - the
+// engine's gemm phase runs at 280-380 GFLOPS and the register peak is 4660; this arm finds which
+// shape closes the gap.  One block = ROWS gate/up rows of one group, GMAX entries staged once in
+// LDS, each warp walks its rows, each lane holds CHUNKS chunks.  The inner loop is the engine's
+// chunk_dot: 16 dp4a per chunk per entry (8 for the dot, 8 for the hx correction) - half the
+// kernel's dp4a work is the hx sum, which is why the engine sits below the register peak.  The
+// GFLOPS printed is model FLOPs (64 per chunk per entry), comparable with the engine's phase time.
+// Variants: the engine's default (word-major LDS, 32 rows per block), the pre-e155b07 byte-major
+// layout, more rows per block, and occupancy changes.
+template <int ROWS, bool WORD_MAJOR, int BLOCK>
+__global__ void __launch_bounds__(BLOCK) tile_kernel(const uint8_t* __restrict__ blobs, int n_groups,
+                                                      long long reps, uint32_t* partials) {
+    constexpr int NC = H / 32;                 // 80 chunks per gate/up row
+    constexpr int CHUNKS = (NC + 31) / 32;     // chunks per lane
+    __shared__ int xs[GMAX * NC * 8];          // the entries' activations as words (8 per chunk)
+    const int g = (int) blockIdx.x % n_groups;
+    const uint8_t* blob = blobs + (size_t) g * 1382400;
+    for (int i = threadIdx.x; i < GMAX * NC; i += BLOCK) {
+        const int k = i / NC, c = i % NC;
+        for (int w = 0; w < 8; ++w)
+            xs[WORD_MAJOR ? (w * GMAX * NC + k * NC + c) : (k * NC * 8 + c * 8 + w)] =
+                (int) (0x01020304u + (unsigned) k * 31u + (unsigned) c * 7u + (unsigned) w);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int ones = 0x01010101;
+    int acc = 0;
+    for (long long rep = 0; rep < reps; ++rep) {
+        for (int rr = warp; rr < ROWS; rr += BLOCK / 32) {
+            const uint8_t* codes = blob + (size_t) rr * ROW_GU;
+            for (int q = 0; q < CHUNKS; ++q) {
+                const int c = lane + 32 * q;
+                if (c >= NC) break;
+                uint2 cb = *(const uint2*) (codes + (size_t) c * 8);
+                const uint8_t* cbytes = (const uint8_t*) &cb;
+                for (int k = 0; k < GMAX; ++k) {
+                    for (int j = 0; j < 8; ++j) {
+                        const unsigned cbyte = cbytes[j];
+                        const int cw = (int) ((cbyte & 3u) | (((cbyte >> 2) & 3u) << 8) |
+                                              (((cbyte >> 4) & 3u) << 16) | (((cbyte >> 6) & 3u) << 24));
+                        const int idx = WORD_MAJOR ? (j * GMAX * NC + k * NC + c) : (k * NC * 8 + c * 8 + j);
+                        acc += __dp4a(cw, xs[idx], 0) + __dp4a(ones, xs[idx], 0);
+                    }
+                }
+            }
+        }
+    }
+    if (acc < 0) acc = -acc;
+    atomicAdd(&partials[blockIdx.x & 511], (uint32_t) acc);
+}
+
+int run_tile_arm(long long gib) {
+    const long long bytes = gib * (1ll << 30);
+    const int n_groups = (int) (bytes / 1382400);
+    if (n_groups < 64) { std::fprintf(stderr, "igpu_gtt_micro: tile arm needs >= 64 blobs\n"); return 2; }
+    uint8_t* d_blobs = nullptr;
+    CHECK(hipMalloc(&d_blobs, (size_t) bytes));
+    std::vector<uint8_t> host((size_t) bytes, 0x37);
+    CHECK(hipMemcpy(d_blobs, host.data(), (size_t) bytes, hipMemcpyHostToDevice));
+    uint32_t* d_partials = nullptr;
+    CHECK(hipMalloc(&d_partials, 512 * sizeof(uint32_t)));
+    const long long reps = 200;
+    const int kBlocks = 512;   // 16 blocks per CU on 32 CUs
+    struct Variant { const char* name; int rows; bool word_major; int block; };
+    const Variant vars[] = {
+        {"engine default (word-major, 32 rows, 256 thr)", 32, true,  256},
+        {"byte-major (pre-e155b07, 32 rows, 256 thr)    ", 32, false, 256},
+        {"word-major, 64 rows, 256 thr                  ", 64, true,  256},
+        {"word-major, 32 rows, 512 thr                  ", 32, true,  512},
+        {"word-major, 16 rows, 128 thr                  ", 16, true,  128},
+    };
+    for (const auto& v : vars) {
+        CHECK(hipMemsetAsync(d_partials, 0, 512 * sizeof(uint32_t), 0));
+        auto launch = [&]() {
+            if (v.word_major && v.rows == 32 && v.block == 256) tile_kernel<32, true, 256><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.word_major && v.rows == 64 && v.block == 256) tile_kernel<64, true, 256><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.word_major && v.rows == 16 && v.block == 128) tile_kernel<16, true, 128><<<kBlocks, 128, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else tile_kernel<32, false, 256><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+        };
+        launch(); CHECK(hipGetLastError()); CHECK(hipDeviceSynchronize());   // warm
+        const auto t0 = std::chrono::steady_clock::now();
+        launch();
+        CHECK(hipStreamSynchronize(0));
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        const double flops = (double) kBlocks * (double) v.rows * GMAX * (H / 32) * 64.0 * (double) reps / 1e9 / (ms / 1000.0);
+        std::printf("igpu_gtt_micro: tile arm: %s  %6.0f GFLOPS\n", v.name, flops);
+    }
+    CHECK(hipFree(d_partials));
+    CHECK(hipFree(d_blobs));
+    return 0;
+}
+
+
 // igpu-rework P2.4: the engine's gather phase, in a process without the engine.  The 0.1.36 alias
 // profile's "dequant" phase (8.0 s, 26 %) actually contains the MMQ-on gather: per expert, one
 // copy16_kernel launch (gate+up -> group gu slot, down -> group d slot), GTT read + VRAM write.
@@ -953,6 +1050,8 @@ int main(int argc, char** argv) {
             return run_scatter_arm((long long) std::atof(argv[i + 1]));
         if (std::strcmp(argv[i], "--alias") == 0 && i + 1 < argc)
             return run_alias_arm((long long) std::atof(argv[i + 1]));
+        if (std::strcmp(argv[i], "--tile") == 0 && i + 1 < argc)
+            return run_tile_arm((long long) std::atof(argv[i + 1]));
         if (std::strcmp(argv[i], "--dp4a-peak") == 0 && i + 2 < argc)
             return run_dp4a_peak_arm(std::atoi(argv[i + 1]), (long long) std::atof(argv[i + 2]));
         if (std::strcmp(argv[i], "--dp4a") == 0 && i + 1 < argc) {

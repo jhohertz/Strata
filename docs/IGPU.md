@@ -1883,3 +1883,25 @@ pack's shapes (the padded-X case needs the PF_PAD path, unsupported for the i-qu
 tensors), and `STRATA_WMMA_GEMM=1` is flat - 34.7 vs 34.65 tok/s.  The dense phase is already
 near hardware; the expert gemm has no env knob - its tile is compile-time constants, so the
 6-8%-of-peak gap is a code change, not a setting.
+
+## P2.16: the tile search - the shape is not the wall (same boot, device-only arm, zero fault lines)
+
+The engine's grouped gate/up pattern run on device memory (blobs copied once, no host read),
+512 blocks x 200 reps:
+
+| variant | GFLOPS |
+| --- | --- |
+| engine default (word-major LDS, 32 rows, 256 threads) | **1243** |
+| byte-major (pre-e155b07) | 1167 |
+| 64 rows, 256 thr | 1237 |
+| 32 rows, 512 thr | 1167 |
+| 16 rows, 128 thr | 1220 |
+
+The shape reaches 1243 GFLOPS - 4x the engine's 306 - and every tile variant lands within 6% of
+the default, so the inner loop is already near its ceiling.  The gemm phase reads only ~813 MB of
+codes (one blob-row read per group), so it is not read-bound either.  The 4x gap is the engine's
+execution structure around the kernel: per-group launches, activation staging, and the
+dequant-then-BLAS dependency (the engine's gemm phase is hipBLASLt on dequantized fp16, not this
+dp4a shape).  The next test is `STRATA_PF_FUSED=1` with timing on a fresh boot - the fused path is
+where the 1243 should show up, and P2.7 measured it at the same ~39 tok/s wall, so the loss is in
+how the fused path is driven, not in its math.
