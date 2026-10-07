@@ -1833,8 +1833,28 @@ One comparison this session could not finish: the 0.1.36 one-shot decode was
 touch the decode expert kernels both ship A/B toggles (`STRATA_OLD_GROUPED=1`
 reselects the pre-e155b07 Q2_0 grouped and per-hit kernels; `STRATA_S2_SWIGLU_Q8=0`
 keeps the pre-3281ac3 two-launch SwiGLU+quantize), so a fresh boot needs only a
-canary plus three short decode runs to attribute the gap.  On the 20:31 boot the
-attempt was inconclusive - by 17:30 the canary prompt had started repeating a
-token (the spent-boot signal, 47 clean + 4 failed lifecycles that boot), and all
-three variants ran at 9.0 tok/s in the repetition, which measures the spent boot,
-not the kernels.
+canary plus three short decode runs to attribute the gap.
+
+**Measured on the fresh boot (Oct 6, 21:56-23:25, zero journal fault lines, six
+lifecycles), the gap is not a code regression.**  Same short prompt (the 44-token
+arithmetic smoke), same flags, three kernel variants plus the old binary:
+
+| run | decode | draft acceptance |
+| --- | --- | --- |
+| 0.1.40, default kernels | 9.15 tok/s | 53/79 (67%) |
+| 0.1.40, `STRATA_OLD_GROUPED=1` | 9.07 | 54/79 (68%) |
+| 0.1.40, `STRATA_S2_SWIGLU_Q8=0` | 9.10 | 54/82 (66%) |
+| 0.1.36 binary, same prompt | 9.56 | 54/80 |
+
+And the apples-to-apples longfill on the same boot: 0.1.40 35.70 prefill / 15.19
+decode, 0.1.36 35.46 / 15.30, both 77/80 accepted - within 1% of each other.  The
+18.8-20.5 figure was a different measurement condition (higher acceptance), not a
+faster kernel: the upstream kernel changes are neutral on this APU, which e155b07
+itself predicts (its new grid is below one block per SM on small parts).
+
+**Canary refinement:** the spent-boot signal is a loop *instead of the answer*.
+A post-answer `<|im_start|>` repetition in one-shot greedy mode is model behavior -
+it was present on clean boots too (the 17:28 arithmetic run answered 396 correctly,
+then looped) - and does not invalidate the timing numbers, only the acceptance
+numbers, because the loop rounds are real rounds the draft head mispredicts.
+Judge the canary by the answer, not by the tail.
