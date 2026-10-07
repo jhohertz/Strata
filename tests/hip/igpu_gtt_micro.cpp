@@ -811,6 +811,10 @@ int run_tile_arm(long long gib) {
         {"engine shape, 1 entry per group (decode)       ", 32, true, 256, 1},
         {"8 rows, 256 thr, 1 entry                       ", 8,  true, 256, 1},
         {"4 rows, 128 thr, 1 entry                       ", 4,  true, 128, 1},
+        {"1 entry, whole blob (1280 rows/block)      ", 1280, true, 256, 1},
+        {"1 entry, 512 rows/block                    ", 512,  true, 256, 1},
+        {"1 entry, 256 rows/block                    ", 256,  true, 256, 1},
+        {"1 entry, 128 rows/block                    ", 128,  true, 256, 1},
     };
     for (const auto& v : vars) {
         CHECK(hipMemsetAsync(d_partials, 0, 512 * sizeof(uint32_t), 0));
@@ -819,6 +823,10 @@ int run_tile_arm(long long gib) {
             else if (v.ent == 2) tile_kernel<32, true, 256, 2><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
             else if (v.ent == 1 && v.rows == 8) tile_kernel<8, true, 256, 1><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
             else if (v.ent == 1 && v.rows == 4) tile_kernel<4, true, 128, 1><<<kBlocks, 128, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.ent == 1 && v.rows == 1280) tile_kernel<1280, true, 256, 1><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.ent == 1 && v.rows == 512) tile_kernel<512, true, 256, 1><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.ent == 1 && v.rows == 256) tile_kernel<256, true, 256, 1><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
+            else if (v.ent == 1 && v.rows == 128) tile_kernel<128, true, 256, 1><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
             else if (v.ent == 1) tile_kernel<32, true, 256, 1><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
             else if (v.word_major && v.rows == 32 && v.block == 256) tile_kernel<32, true, 256, 8><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
             else if (v.word_major && v.rows == 64 && v.block == 256) tile_kernel<64, true, 256, 8><<<kBlocks, 256, 0, (hipStream_t) 0>>>(d_blobs, n_groups, reps, d_partials);
