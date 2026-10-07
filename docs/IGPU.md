@@ -1023,7 +1023,11 @@ spending its 8.0 s somewhere else.
 | `STRATA_PREFILL_MMQ=0` (f16 dequant + tuned hipBLASLt) | 39.0 tok/s (29788 ms) |
 | `STRATA_PF_FUSED=1` (0.1.36's fused Q2_0 prompt experts) | 38.6 tok/s (30096 ms) |
 
-**Every expert compute path lands at ~39 tok/s.**  The total prefill is not
+**Every expert compute path lands at ~39 tok/s.**  (Corrected in `docs/GFX1103.md`
+§13: this build defines neither `STRATA_PREFILL_MMQ` nor `STRATA_PREFILL_FUSED`, so
+all three rows above ran the same f16 path - the env toggles could not engage the
+paths they named.  With MMQ compiled in the same prompt runs 2.44x faster.)
+The total prefill is not
 sensitive to which kernels do the expert math - so the ~30.5 s wall is set by
 something shared (per-expert dispatch, per-layer syncs, or the non-expert
 phases), not by the gemm choice.  This also reframes the "gemm gate/up 39 %"
