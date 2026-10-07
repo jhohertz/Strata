@@ -524,19 +524,31 @@ void check_all() {
 // ---------------------------------------------------------------- --bench
 // Engine-like shapes with the blobs cycled through a set larger than the L2, so each call reads its codes from
 // DRAM as the engine's do.  Reports microseconds per call and the codes' effective bandwidth.
-void bench() {
+void bench(bool host_blobs) {
     int dev = 0;
     cudaDeviceProp prop{};
     ck(cudaGetDevice(&dev), "dev");
     ck(cudaGetDeviceProperties(&prop, dev), "props");
     const int nb = std::max(48, (int) (3ull * (size_t) prop.l2CacheSize / BLOB) + 8);
-    std::printf("bench: %s, L2 %d MB, %d blobs (%.0f MB) cycled\n", prop.name, prop.l2CacheSize >> 20, nb,
-                nb * (double) BLOB / 1e6);
+    std::printf("bench: %s, L2 %d MB, %d blobs (%.0f MB) cycled, %s\n", prop.name, prop.l2CacheSize >> 20, nb,
+                nb * (double) BLOB / 1e6, host_blobs ? "HOST-mapped blobs (the alias mapping the engine reads)" : "device blobs");
     std::mt19937 rng(7);
     Fixture fx;
     fx.nb = nb;
-    fx.d = dalloc<uint8_t>((size_t) nb * BLOB);
-    {
+    uint8_t* h_blob = nullptr;
+    if (host_blobs) {
+        // The engine's decode reads the resident complement through the GTT mapping, not through a
+        // device allocation. Same bytes, different path - that is the mapping the decode number has to
+        // be compared against.
+        ck(cudaHostAlloc((void**) &h_blob, (size_t) nb * BLOB, cudaHostAllocMapped), "host blobs");
+        std::vector<uint8_t> b(BLOB);
+        for (int i = 0; i < nb; ++i) {
+            fill_blob(b.data(), rng);
+            std::memcpy(h_blob + (size_t) i * BLOB, b.data(), BLOB);
+        }
+        ck(cudaHostGetDevicePointer((void**) &fx.d, h_blob, 0), "host blob device ptr");
+    } else {
+        fx.d = dalloc<uint8_t>((size_t) nb * BLOB);
         std::vector<uint8_t> b(BLOB);
         for (int i = 0; i < nb; ++i) {
             fill_blob(b.data(), rng);
@@ -664,8 +676,10 @@ void bench() {
 
 int main(int argc, char** argv) {
     bool do_bench = false;
+    bool do_host_blobs = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--bench") == 0) do_bench = true;
+        if (std::strcmp(argv[i], "--bench-host") == 0) { do_bench = true; do_host_blobs = true; }
         else if (std::strcmp(argv[i], "--selftest") != 0) {
             std::fprintf(stderr, "usage: s2_expert_grouped_parity [--selftest] [--bench]\n");
             return 2;
@@ -673,7 +687,7 @@ int main(int argc, char** argv) {
     }
     std::printf("s2_expert_grouped_parity: new expert kernels vs the previous ones, bitwise\n");
     check_all();
-    if (do_bench) bench();
+    if (do_bench) bench(do_host_blobs);
     std::printf("s2_expert_grouped_parity: %d failures\n%s\n", g_fail, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }
