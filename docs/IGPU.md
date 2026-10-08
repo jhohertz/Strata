@@ -1787,6 +1787,13 @@ back to a mock engine; the port is whatever the server finds free - it reports t
 URL it bound in its READY line.  `--spec 4` is the MTP draft head's speculation, and
 `--mtp mtp-q2_0/rt` the runtime files it reads.)
 
+The draft head is worth keeping on this card, with one caveat measured on 2026-10-08: on real prose it
+raises decode from 10.36 tok/s (suffix drafts only) to 13.76 (`--spec 4`, 2.37 tokens per round against
+1.50), even though the draft layer is a whole extra layer costing 25 ms per round and 795 MiB. On text
+whose continuation is already present in the context, the free suffix drafter predicts better than the
+learned head, and enabling MTP suppresses it - there the same setting measures 8.28 against 16.16. The
+numbers and the knob sweep are section 20 of docs/GFX1103.md.
+
 The debugging session ran forty-one full userptr-lifecycle equivalents on the 20:31 boot
 (the canary, the one-shot reproductions, the serve-direct bisection, the server requests -
 each engine process does the 31.64 GiB register -> DMA -> run -> unregister) and the whole-
