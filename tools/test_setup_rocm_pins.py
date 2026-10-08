@@ -55,6 +55,12 @@ class RocmPick(unittest.TestCase):
         self.assertEqual((version, note), ("7.14.0a20260608", None))
         self.assertGreaterEqual(setup.rocm_vkey(version)[:2], (7, 11))
 
+    def test_gfx1103_takes_the_7_14_build_measured_on_a_780M(self):
+        """The newest 7.14 build in that index (7.14.0a20260612) segfaults in the HSA runtime's GpuAgent::InitDma()
+        on the reference Radeon 780M; 7.14.0a20260608 starts and runs (docs/GFX1103.md §19)."""
+        version, note = self.want("gfx1103")
+        self.assertEqual((version, note), ("7.14.0a20260608", None))
+
     def test_pinned_version_gone_falls_back_to_the_same_line_with_a_warning(self):
         old = setup.ROCM_FAMILY_PINS["gfx103X-all"]
         with mock.patch.dict(setup.ROCM_FAMILY_PINS, {"gfx103X-all": "7.13.0a20260301"}):

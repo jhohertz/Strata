@@ -1639,7 +1639,7 @@ ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   
 # STRATA_ROCM_VERSION still forces one exact version (no lookup).
 ROCM_VERSION_DEFAULT = "7.10.0a20251120"                 # what Strata's HIP build was tested with (gfx120X, gfx110X)
 ROCM_FAMILY_PINS = {"gfx103X-all": "7.13.0a20260515",    # #1103: 7.13.0a20260515 runs; the 7.14 nightlies time out
-                    "gfx110X-all": "7.10.0a20251121",    # the gfx1103 iGPU's family: this index has no ...20251120
+                    "gfx110X-all": "7.14.0a20260608",    # the gfx1103 iGPU's family: measured on a Radeon 780M (hipBLASLt 1.4.0); the newer 7.14.0a20260612 build segfaults in the HSA runtime's GpuAgent::InitDma() on that card (docs/GFX1103.md §19)
                     "gfx1151": "7.14.0a20260608"}        # #1267: 7.14.0a20260529 to 20260608 run on kernel 7.2.8; the 7.10 wheel segfaults
 ROCM_VERSION_OVERRIDE = os.environ.get("STRATA_ROCM_VERSION") or None
 ROCM_VERSION = ROCM_VERSION_OVERRIDE or ROCM_VERSION_DEFAULT   # kept for callers that read one version
