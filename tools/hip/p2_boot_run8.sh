@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(dirname "$0")/gfx1103_env.sh"
 # igpu-rework P2.9: the no-reboot-ritual protocol - probe first, burn in second, and stop on the
 # machine's own signal instead of praying after an idle.  (v2: never kills the engine - see below)
 #
@@ -38,7 +39,7 @@
 # Success criterion for the A/B: the chunked boot outlasts the baseline (10+ clean runs vs 4).
 set -u
 cd "$(cd "$(dirname "$0")/../.." && pwd)"
-O=/tmp/p2-out
+O="$OUT"
 mkdir -p "$O"
 CHUNK_GIB="${CHUNK_GIB:-0}"
 MAX_RUNS="${MAX_RUNS:-10}"
@@ -52,7 +53,7 @@ step() { echo "=== P2.9 [$TAG $1] $(date '+%H:%M:%S') ===" | tee -a "$O/run8.log
 
 need_ids() {
     if [ ! -f "$O/$1" ]; then
-        [ -f "$O/smoke_ids.json" ] || python3 tools/hip/gfx1103_smoke.py prep packs/qwen38-flash-next-q2_0 "$O" >&2
+        [ -f "$O/smoke_ids.json" ] || python3 tools/hip/gfx1103_smoke.py prep "$PACK" "$O" >&2
         key="${1%.ids}"
         python3 - "$O" "$key" "$1" <<'EOF'
 import json, sys
@@ -80,9 +81,9 @@ run_one() {
     local n="$1"
     local t0; t0=$(date '+%F %H:%M:%S')
     : > "$O/b8-$n.err"
-    ./build-hip/strata --pack packs/qwen38-flash-next-q2_0 \
-      --native /home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
-      --ple-gguf /home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
+    "$BUILD/strata" --pack "$PACK" \
+      --native "$SHARD1" \
+      --ple-gguf "$SHARD2" \
       --mmap-experts --expert-profile data/expert-profile.bin --expert-cache 6000 --prefill 512 --spec 4 \
       --spec-min-p 0.5 --max-context 4096 --kv int8 --pool-workers 8 --adapt-every 0 --pcie-frac 0 \
       --vram-reserve-mib 1024 --greedy --max-new 16 --tokens "$IDS" > "$O/b8-$n.out" 2> "$O/b8-$n.err" &
@@ -127,7 +128,7 @@ run_one() {
 }
 
 step "gate (micro)"
-./build-hip/hip_intrinsics || { echo "gate failed - stop" | tee -a "$O/run8.log"; exit 1; }
+"$BUILD/hip_intrinsics" || { echo "gate failed - stop" | tee -a "$O/run8.log"; exit 1; }
 sleep 60
 IDS=$(need_ids longfill.ids)
 

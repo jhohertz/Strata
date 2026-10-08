@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(dirname "$0")/gfx1103_env.sh"
 # igpu-rework P2.7: the STRATA_MMQ_GROUP A/B after a FULL power cycle (hold the power button
 # or unplug the PSU - a plain reboot does NOT clear the fault cluster, P2.8) and a long idle.
 #
@@ -13,7 +14,7 @@
 # against that number are still meaningful if the third run is sacrificed.
 set -u
 cd "$(cd "$(dirname "$0")/../.." && pwd)"
-O=/tmp/p2-out
+O="$OUT"
 mkdir -p "$O"
 export STRATA_IGPU_ALIAS=1 STRATA_GROUP_COPY=1 STRATA_HIPBLASLT_WARMUP=1
 export STRATA_HIPBLASLT_TUNING="$PWD/tools/hip/gfx1103-hipblaslt-100401.txt"
@@ -23,7 +24,7 @@ step() { echo "=== P2.7 [$1] $(date '+%H:%M:%S') ===" | tee -a "$O/run.log"; }
 
 need_ids() {
     if [ ! -f "$O/$1" ]; then
-        [ -f "$O/smoke_ids.json" ] || python3 tools/hip/gfx1103_smoke.py prep packs/qwen38-flash-next-q2_0 "$O" >&2
+        [ -f "$O/smoke_ids.json" ] || python3 tools/hip/gfx1103_smoke.py prep "$PACK" "$O" >&2
         key="${1%.ids}"
         python3 - "$O" "$key" "$1" <<'EOF'
 import json, sys
@@ -49,16 +50,16 @@ run_arm() {
             sleep 1
         done
     ) & local THERM=$!
-    env STRATA_MMQ_GROUP="$g" timeout 900 ./build-hip/strata --pack packs/qwen38-flash-next-q2_0 \
-      --native /home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
-      --ple-gguf /home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
+    env STRATA_MMQ_GROUP="$g" timeout 900 "$BUILD/strata" --pack "$PACK" \
+      --native "$SHARD1" \
+      --ple-gguf "$SHARD2" \
       --mmap-experts --expert-profile data/expert-profile.bin --expert-cache 6000 --prefill 512 --spec 4 \
       --spec-min-p 0.5 --max-context 4096 --kv int8 --pool-workers 8 --adapt-every 0 --pcie-frac 0 \
       --vram-reserve-mib 1024 --greedy --max-new 160 --tokens "$IDS" > "$O/lf-mmq$g.out" 2> "$O/lf-mmq$g.err"
     echo "exit=$?" | tee -a "$O/run.log"
     kill "$THERM" 2>/dev/null
     grep -E 'hostloop|strata generate: prefill|prefill timing|error' "$O/lf-mmq$g.err" | tee -a "$O/run.log"
-    python3 tools/hip/gfx1103_smoke.py check packs/qwen38-flash-next-q2_0 "$O/lf-mmq$g.out" longfill 2>&1 | tee -a "$O/run.log" | head -3
+    python3 tools/hip/gfx1103_smoke.py check "$PACK" "$O/lf-mmq$g.out" longfill 2>&1 | tee -a "$O/run.log" | head -3
     local tok
     tok=$(grep -oE 'prefill 1162 tokens in [0-9]+ chunks, [0-9.]+ ms \([0-9.]+ tok/s\)' "$O/lf-mmq$g.err" | grep -oE '\([0-9.]+ tok/s' | grep -oE '[0-9.]+')
     if [ -n "${tok:-}" ] && python3 -c "import sys; sys.exit(0 if float('$tok') >= 20.0 else 1)"; then
@@ -70,7 +71,7 @@ run_arm() {
 }
 
 step gate
-./build-hip/hip_intrinsics || { echo "gate failed - stop" | tee -a "$O/run.log"; exit 1; }
+"$BUILD/hip_intrinsics" || { echo "gate failed - stop" | tee -a "$O/run.log"; exit 1; }
 sleep 60
 
 IDS=$(need_ids longfill.ids)

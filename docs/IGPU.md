@@ -964,8 +964,8 @@ noise, and in the improving direction).
 
 The remaining suspect for the -46 % was "somewhere in the 35 % of non-expert
 phases".  To settle it, the 0.1.29-era branch (commit `41da073`, the one that
-measured 68.8) was rebuilt in a worktree (`/home/jhohertz/co/Strata-029`,
-pack and profile symlinked, `STRATA_PREFILL_TIMING=1` available there too)
+measured 68.8) was rebuilt in a separate worktree (pack and profile symlinked,
+`STRATA_PREFILL_TIMING=1` available there too)
 and run with the exact 0.1.29-era smoke flags (`p2_boot_run3.sh`):
 
 | config (same boot, same flags) | longfill prefill | staging |
@@ -1767,10 +1767,10 @@ The serve config is a local file (strata-*.json is gitignored); on this box it i
     {
       "exe": "./build-hip/strata",
       "args": ["--serve", "--pack", "packs/qwen38-flash-next-q2_0",
-               "--native", "/home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
-               "--ple-gguf", "/home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf",
+               "--native", "<model shard 1.gguf>",
+               "--ple-gguf", "<model shard 2.gguf>",
                "--mmap-experts", "--expert-profile", "data/expert-profile.bin",
-               "--expert-cache", "6000", "--prefill", "512", "--spec", "4",
+               "--expert-cache", "6000", "--prefill", "2048", "--spec", "4",
                "--spec-min-p", "0.5", "--mtp", "mtp-q2_0/rt",
                "--max-context", "4096", "--pool-workers", "8",
                "--adapt-every", "0", "--pcie-frac", "0", "--vram-reserve-mib", "1024"],

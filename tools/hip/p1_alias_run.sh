@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(dirname "$0")/gfx1103_env.sh"
 # P1 alias smoke with hang forensics. Runs the arithmetic prompt with the aliasing expert cache and,
 # if the engine stops progressing, captures: the GPU busy %, the CPU-side backtraces (gdb), and the last
 # trace lines - then kills.  The APU must be rebooted afterwards (kill with possibly in-flight GPU work).
@@ -6,13 +7,13 @@
 #   tools/hip/p1_alias_run.sh [OUTDIR]
 set -u
 cd "$(dirname "$0")/../.."
-OUT="${1:-/tmp/p1-out}"; mkdir -p "$OUT"
-IDS=$(python3 -c "import json;print(json.load(open('/tmp/p0-out/smoke_ids.json'))['arithmetic'])")
+OUT="${1:-$OUT}"; mkdir -p "$OUT"
+IDS=$(python3 -c "import json;print(json.load(open('$OUT/smoke_ids.json'))['arithmetic'])")
 echo "== $(date -Is) alias arithmetic (STRATA_TRACE=1)"
 ( env STRATA_IGPU_ALIAS=1 STRATA_TRACE=1 STRATA_HIPBLASLT_TUNING="$PWD/tools/hip/gfx1103-hipblaslt-100401.txt" \
-    timeout --signal=KILL 900 "$PWD/build-hip/strata" --pack packs/qwen38-flash-next-q2_0 \
-    --native /home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
-    --ple-gguf /home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
+    timeout --signal=KILL 900 "$PWD/$BUILD/strata" --pack "$PACK" \
+    --native "$SHARD1" \
+    --ple-gguf "$SHARD2" \
     --mmap-experts --expert-profile data/expert-profile.bin --expert-cache 6000 --prefill 512 --spec 4 \
     --spec-min-p 0.5 --max-context 4096 --kv int8 --pool-workers 8 --adapt-every 0 --pcie-frac 0 \
     --vram-reserve-mib 1024 --greedy --max-new 160 --tokens "$IDS" \

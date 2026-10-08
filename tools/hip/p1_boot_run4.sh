@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(dirname "$0")/gfx1103_env.sh"
 # Boot protocol 4 (the localizing boot):
 #   1) gate
 #   2) micro --scatter 32: the engine's exact gather shape (24,576 CTAs x 1.38 MiB) on a registered
@@ -8,35 +9,34 @@
 #      interrupt is sent and the boot is preserved for a chained smoke.
 set -u
 cd "$(dirname "$0")/../.."
-NAT=/home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0
-ARGS=(--pack packs/qwen38-flash-next-q2_0 --native $NAT/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
-      --ple-gguf $NAT/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf
+ARGS=(--pack "$PACK" --native "$SHARD1"
+      --ple-gguf "$SHARD2"
       --mmap-experts --expert-profile data/expert-profile.bin --expert-cache 6000 --prefill 512 --spec 4
       --spec-min-p 0.5 --max-context 4096 --kv int8 --pool-workers 8 --adapt-every 0 --pcie-frac 0
       --vram-reserve-mib 1024 --greedy --max-new 160)
 
 echo "== 1) gate $(date +%H:%M:%S)"
-timeout 60 ./build-hip/hip_intrinsics 2>&1 | tail -1 | grep -q 'parity OK' || { echo "FAIL: gate"; exit 1; }
+timeout 60 "$BUILD/hip_intrinsics" 2>&1 | tail -1 | grep -q 'parity OK' || { echo "FAIL: gate"; exit 1; }
 
 echo "== 2) micro --scatter 32  $(date +%H:%M:%S)"
-timeout 600 ./build-hip/igpu_gtt_micro --scatter 32 2>&1 | tail -3
+timeout 600 "$BUILD/igpu_gtt_micro" --scatter 32 2>&1 | tail -3
 [ ${PIPESTATUS[0]} -eq 0 ] || { echo "FAIL: scatter - the KFD path cannot serve the gather pattern; the alias design must bounce the prompt path (decode-only aliasing). Stop and reboot."; exit 1; }
 
 echo "== 3) engine alias arithmetic under gdb, traced  $(date +%H:%M:%S)"
-IDS=$(python3 -c "import json;print(json.load(open('/tmp/p0-out/smoke_ids.json'))['arithmetic'])")
-cat > /tmp/p1-envwrap.sh << 'W'
+IDS=$(python3 -c "import json;print(json.load(open('$OUT/smoke_ids.json'))['arithmetic'])")
+cat > $OUT/envwrap.sh << 'W'
 #!/usr/bin/env bash
 export STRATA_IGPU_ALIAS=1 STRATA_TRACE=1 STRATA_HIPBLASLT_TUNING="$STRATA_T"
-exec /home/jhohertz/co/Strata/build-hip/strata "$@"
+exec $PWD/$BUILD/strata "$@"
 W
-chmod +x /tmp/p1-envwrap.sh
+chmod +x $OUT/envwrap.sh
 rm -f /tmp/gdbfifo; mkfifo /tmp/gdbfifo
-OUT=/tmp/p1-out/gdb.out
+OUT="$OUT/gdb.out"
 # interactive gdb (NOT -batch: in batch mode a hung `run` never reads the interrupt off stdin).
 # timeout is the backstop: it signals the whole process group, so a wedged gdb cannot hold the script.
 env STRATA_T="$PWD/tools/hip/gfx1103-hipblaslt-100401.txt" \
   timeout 900 gdb -q -nx -ex 'set debuginfod enabled off' -ex 'set pagination off' -ex 'set confirm off' -ex run \
-     --args bash /tmp/p1-envwrap.sh "${ARGS[@]}" --tokens "$IDS" \
+     --args bash $OUT/envwrap.sh "${ARGS[@]}" --tokens "$IDS" \
   < /tmp/gdbfifo > "$OUT" 2>&1 &
 GDBPID=$!
 (

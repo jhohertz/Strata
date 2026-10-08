@@ -1,4 +1,5 @@
 #!/bin/bash
+source "$(dirname "$0")/gfx1103_env.sh"
 # igpu-rework: bring up the OpenAI/Anthropic server on the 8700G/780M box.
 #
 # Protocol (post-BIOS, docs/IGPU.md P2.14): run unless there is EVIDENCE of a bad driver
@@ -11,10 +12,9 @@
 # If anything faults: LEAVE THE PROCESS ALIVE (no kill, no timeout on the server), then an
 # AC-cut power cycle (unplug/PSU + hold power ~10 s).
 set -u
-cd /home/jhohertz/co/Strata
-MODEL_DIR=/home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
+cd "$(dirname "$0")/../.."
 export STRATA_IGPU_ALIAS=1 STRATA_GROUP_COPY=1 STRATA_SSD_KEEPALIVE=0
-export STRATA_HIPBLASLT_WARMUP=1 STRATA_HIPBLASLT_TUNING="$PWD/tools/hip/gfx1103-hipblaslt-100401.txt"
+export STRATA_HIPBLASLT_WARMUP=1 STRATA_HIPBLASLT_TUNING="$PWD/${TUNING:-tools/hip/gfx1103-hipblaslt-100401.txt}"
 LOG=strata-igpu-serve.log
 PORT=${1:-8080}
 
@@ -22,21 +22,21 @@ echo "=== boot health ==="
 uptime
 echo "restore/MES-failed/evict-failed lines this boot: $(journalctl -b --no-pager 2>/dev/null | grep -cE 'restore_userptr_worker|MES failed|Failed to evict')"
 
-if [ ! -f /tmp/p2-out/smoke_ids.json ]; then
-    mkdir -p /tmp/p2-out
-    python3 tools/hip/gfx1103_smoke.py prep packs/qwen38-flash-next-q2_0 /tmp/p2-out || exit 1
+if [ ! -f "$OUT"/smoke_ids.json ]; then
+    mkdir -p "$OUT"
+    python3 tools/hip/gfx1103_smoke.py prep "$PACK" "$OUT" || exit 1
 fi
 
 echo "=== arithmetic canary (short generate run) ==="
-IDS=$(python3 -c "import json; print(json.load(open('/tmp/p2-out/smoke_ids.json'))['arithmetic'])")
-./build-hip/strata --pack packs/qwen38-flash-next-q2_0 \
-  --native "$MODEL_DIR/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf" \
-  --ple-gguf "$MODEL_DIR/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf" \
-  --mmap-experts --expert-profile data/expert-profile.bin --expert-cache 6000 --prefill 512 --spec 4 \
+IDS=$(python3 -c "import json; print(json.load(open('"$OUT"/smoke_ids.json'))['arithmetic'])")
+"$BUILD/strata" --pack "$PACK" \
+  --native "$SHARD1" \
+  --ple-gguf "$SHARD2" \
+  --mmap-experts --expert-profile data/expert-profile.bin --expert-cache 6000 --prefill 2048 --spec 4 \
   --spec-min-p 0.5 --max-context 4096 --kv int8 --pool-workers 8 --adapt-every 0 --pcie-frac 0 \
-  --vram-reserve-mib 1024 --greedy --max-new 160 --tokens "$IDS" > /tmp/p2-out/serve-canary.out 2> /tmp/p2-out/serve-canary.err \
-  || { echo "canary engine died"; grep -E 'error|fault' /tmp/p2-out/serve-canary.err | tail -3; exit 1; }
-if ! python3 tools/hip/gfx1103_smoke.py check packs/qwen38-flash-next-q2_0 /tmp/p2-out/serve-canary.out arithmetic | head -1 | grep -q PASS; then
+  --vram-reserve-mib 1024 --greedy --max-new 160 --tokens "$IDS" > "$OUT/serve-canary.out" 2> "$OUT/serve-canary.err" \
+  || { echo "canary engine died"; grep -E 'error|fault' "$OUT"/serve-canary.err | tail -3; exit 1; }
+if ! python3 tools/hip/gfx1103_smoke.py check "$PACK" "$OUT"/serve-canary.out arithmetic | head -1 | grep -q PASS; then
     echo "CANARY FAILED - do not start the server"; exit 1
 fi
 echo "canary PASS"

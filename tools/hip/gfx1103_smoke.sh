@@ -1,17 +1,15 @@
 #!/bin/bash
+source "$(dirname "$0")/gfx1103_env.sh"
 # gfx1103 Phase-B smoke driver (docs/GFX1103.md, §6).  One-shot generate mode,
 # four checks, run to completion - the driver NEVER signals the engine mid-run
 # (killing a HIP process with in-flight GPU work wedges this APU's GPU; §9.11).
 #
-# Usage: gfx1103_smoke.sh   (paths overridable via PACK/SHARD1/SHARD2/STRATA/OUT)
+# Usage: gfx1103_smoke.sh   (paths come from tools/hip/gfx1103_env.sh: BUILD, PACK, SHARD1, SHARD2, OUT;
+#                           TUNING defaults to the system-ROCm table - see §19 for the wheel-path table)
 set -u
-cd /home/jhohertz/co/Strata
+cd "$(dirname "$0")/../.."
 
-PACK=${PACK:-packs/qwen38-flash-next-q2_0}
-SHARD1=${SHARD1:-/home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf}
-SHARD2=${SHARD2:-/home/jhohertz/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf}
-STRATA=${STRATA:-./build-hip/strata}
-OUT=${OUT:-/tmp/strata-smoke}
+STRATA="$BUILD/strata"
 TUNING=${TUNING:-tools/hip/gfx1103-hipblaslt-100401.txt}
 mkdir -p "$OUT"
 SUM="$OUT/summary.txt"
@@ -23,9 +21,9 @@ say() { echo "$@" | tee -a "$SUM"; }
 #  - §9.11.)  The gate uses the project's own binary: an ad-hoc `clang++ -x hip` kernel
 #  faults with "illegal memory access" on this box while CMake-built kernels run fine
 #  (unexplained, §9.13) - a fresh compile would false-alarm on a healthy GPU.
-GATE=./build-hip/hip_intrinsics
+GATE="$BUILD/hip_intrinsics"
 if [ ! -x "$GATE" ]; then
-  say "GPU GATE FAILED: $GATE missing - build first (cmake --build build-hip)."
+  say "GPU GATE FAILED: $GATE missing - build first (cmake --build $BUILD)."
   exit 2
 fi
 if ! timeout 60 "$GATE" > "$OUT/gate.log" 2>&1; then
@@ -48,7 +46,7 @@ for name in arithmetic python marker longfill; do
       timeout 1500 "$STRATA" \
         --pack "$PACK" --native "$SHARD1" --ple-gguf "$SHARD2" \
         --mmap-experts --expert-profile data/expert-profile.bin --expert-cache 6000 \
-        --prefill 512 --spec 4 --spec-min-p 0.5 \
+        --prefill 2048 --spec 4 --spec-min-p 0.5 \
         --max-context 4096 --kv int8 --pool-workers 8 \
         --adapt-every 0 --pcie-frac 0 --vram-reserve-mib 1024 \
         --greedy --max-new 160 --tokens "$IDS" \
