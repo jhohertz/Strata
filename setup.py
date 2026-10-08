@@ -1663,7 +1663,8 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
 AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX 9060 XT (gfx1200) and "
              "RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series (gfx1030) and RX 6700 XT "
              "(gfx1031, #524), and the RX 7600 / 7600 XT (gfx1102, one run reported, #942), all unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
-             "gfx1151: experimental, docs/STRIX_HALO.md)")
+             "gfx1151: experimental, docs/STRIX_HALO.md), and the Radeon 780M / 760M / 740M iGPU (Ryzen 7040 / 8040, "
+             "gfx1103: measured on a 780M with 64 GB RAM, docs/GFX1103.md)")
 
 
 def rocm_index(arch):
@@ -1811,13 +1812,15 @@ def amd_device_access_problem(dev="/dev", access=os.access, listing=glob.glob) -
 
 def gfx1103_notes(gpu, ram) -> list[str]:
     """What setup tells the owner of a Radeon 780M / 760M / 740M (Phoenix / Hawk Point, gfx1103, unified memory): never
-    the Strix Halo text, which is about another chip (gfx1151).  Opt-in only (STRATA_EXPERIMENTAL_GFX1103=1)."""
+    the Strix Halo text, which is about another chip (gfx1151). gfx1103 is accepted; STRATA_EXPERIMENTAL_GFX1103=1 is
+    what makes setup count the GPU's shared pool as memory the model can use."""
     notes = [f"  Radeon 780M / 760M class (gfx1103, Ryzen 7040 / 8040): the CPU and the GPU share one memory pool ({ram:.0f} GB "
              f"seen by the OS + a {gpu.get('dedicated_gb', 0.0):.1f} GB BIOS carve-out), so the model's experts live in "
              "that pool and the expert cache is sized from the memory the OS can give back."]
     notes.append("  " + ("The engine is compiled here for gfx1103" if not WIN else "This GPU has no ready-made Windows engine")
-                 + " (experimental opt-in, STRATA_EXPERIMENTAL_GFX1103=1; measured on one machine, not validated on a real "
-                 "card): see docs/AMD_HIP.md. This is not a Strix Halo.")
+                 + " (measured on a Radeon 780M with 64 GB RAM: docs/GFX1103.md). Set STRATA_EXPERIMENTAL_GFX1103=1 to "
+                 "count the GPU's shared pool as memory the model can use; without it this card is sized on its BIOS "
+                 "carve-out alone. This is not a Strix Halo.")
     if not WIN and gpu.get("shared_gb", 0) < 0.75 * ram - 1:
         notes.append(f"!the GPU can reach {gpu.get('shared_gb', 0):.0f} GB of shared memory (the GTT pool; the kernel's "
                      "default is about half of the RAM). The kernel option ttm.pages_limit raises it; setup changes no "
@@ -2368,7 +2371,6 @@ def rocm_root(archs):
         fail(f"cards of two GPU families ({', '.join(archs)}) need a system ROCm 7 (in /opt/rocm): AMD's Python "
              "wheels come per family", "install ROCm 7 system-wide, or use cards of one family (--gpu N for one card)")
     index = indexes[0]
-    version = list(dict.fromkeys(rocm_version_for(a) for a in archs))[0]   # one family, one version
     stamp = Path(sys.prefix) / ".strata-rocm.json"
     have = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
     wheel = None

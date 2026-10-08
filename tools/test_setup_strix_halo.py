@@ -105,9 +105,25 @@ class ExactArch(unittest.TestCase):
         self.assertIn("gfx1151", setup.AMD_ARCHS)
         self.assertIn("gfx1151", setup.ROCM_INDEXES)
         self.assertTrue(setup.ROCM_INDEXES["gfx1151"].endswith("/gfx1151/"))
-        for a in ("gfx1150", "gfx1152", "gfx1103"):                                  # never supported by accident
+        for a in ("gfx1150", "gfx1152"):                                            # never supported by accident
             self.assertNotIn(a, setup.AMD_ARCHS)
-        self.assertIn("docs/STRIX_HALO.md", setup.AMD_CARDS)
+        self.assertIn("gfx1103", setup.AMD_ARCHS)                                   # the 780M/760M/740M iGPU: accepted
+        self.assertIn("gfx1103", setup.ROCM_INDEXES)                                # its own index: the -dgpu wheel has no gfx1103 libraries
+        self.assertTrue(setup.ROCM_INDEXES["gfx1103"].endswith("/gfx110X-all/"))
+        self.assertIn("docs/GFX1103.md", setup.AMD_CARDS)
+
+    def test_gfx1103_uma_accounting_is_opt_in(self):
+        """gfx1103 is accepted, but counting its GTT pool as usable memory is opt-in: without the flag the card is
+        sized on the BIOS carve-out alone, which is what a 8 GiB UMA iGPU actually has."""
+        with mock.patch.object(setup, "GFX1103_OPT_IN", False):
+            g = setup.amd_apply_uma({"arch": "gfx1103", "vram_gb": 8.0}, 48.0, 64.0)
+            self.assertFalse(g.get("uma"))
+            self.assertAlmostEqual(g["vram_gb"], 8.0)
+        with mock.patch.object(setup, "GFX1103_OPT_IN", True):
+            g = setup.amd_apply_uma({"arch": "gfx1103", "vram_gb": 8.0}, 48.0, 64.0)
+            self.assertTrue(g["uma"])
+            self.assertAlmostEqual(g["dedicated_gb"], 8.0)
+            self.assertAlmostEqual(g["vram_gb"], 8.0 + min(48.0, 64.0 - setup.UMA_OS_LEFT_GB))
 
 
 class PciIds(unittest.TestCase):
@@ -235,7 +251,7 @@ class OtherChips(LinuxBase):
         g = self.one(110003, 0x15BF, 512 << 20, 30 * GIB)
         self.assertEqual(g["arch"], "gfx1103")
         self.assertFalse(g.get("uma"))
-        self.assertIn("gfx1103", setup.amd_problem(g))
+        self.assertIsNone(setup.amd_problem(g))                                     # accepted, not refused (docs/GFX1103.md)
         self.assertIn("780M", g["name"])
 
     def test_discrete_cards(self):
@@ -325,13 +341,17 @@ class WindowsDetection(unittest.TestCase):
 
     def test_other_integrated_radeons(self):
         for did, name, arch in ((0x150E, "AMD Radeon(TM) 890M Graphics", "gfx1150"),
-                                (0x1114, "AMD Radeon(TM) 860M Graphics", "gfx1152"),
-                                (0x15BF, "AMD Radeon(TM) 780M Graphics", "gfx1103")):
+                                (0x1114, "AMD Radeon(TM) 860M Graphics", "gfx1152")):
             ad = [{"name": name, "pnp": rf"PCI\VEN_1002&DEV_{did:04X}&REV_C1\4&2", "ram": 512 << 20}]
             g = setup.amd_gpus_windows(ad, [])[0]
             self.assertEqual(g["arch"], arch)
             self.assertFalse(g.get("uma"))
             self.assertIsNotNone(setup.amd_problem(g))
+        # the 780M is the one integrated Radeon setup does take
+        g = setup.amd_gpus_windows([{"name": "AMD Radeon(TM) 780M Graphics",
+                                     "pnp": r"PCI\VEN_1002&DEV_15BF&REV_C1\4&2", "ram": 512 << 20}], [])[0]
+        self.assertEqual(g["arch"], "gfx1103")
+        self.assertIsNone(setup.amd_problem(g))
 
     def test_hip_listing_of_strix_halo(self):
         """Once the HIP engine is installed the cards are numbered as HIP lists them; the carve-out still comes from the
