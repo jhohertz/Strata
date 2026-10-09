@@ -1761,13 +1761,14 @@ def amd_apply_uma(g: dict, gtt_gb: float = 0.0, ram: float | None = None) -> dic
     the model's experts live in, so it is not extra room beside the RAM.  g gets: uma, dedicated_gb (the carve-out: the
     only part that adds to the RAM, which the low-RAM mode counts) and vram_gb = the memory the GPU can use in all
     (the carve-out plus the shared pool less what the OS keeps), which sizes the context and the parallel slots."""
+    g["gtt_gb"] = gtt_gb                                   # the raw pool, before the cap below, for the notes
     if g.get("uma") or not (is_strix_halo(g) or (GFX1103_OPT_IN and gfx_arch_is(g.get("arch"), "gfx1103"))):
         return g
     ram = ram_gb() if ram is None else ram
     carve = max(0.0, float(g.get("vram_gb") or 0.0))
     shared = gtt_gb if gtt_gb > 0 else ram / 2
     shared = max(0.0, min(shared, ram - UMA_OS_LEFT_GB))
-    g.update({"uma": True, "dedicated_gb": carve, "shared_gb": shared, "vram_gb": carve + shared})
+    g.update({"uma": True, "dedicated_gb": carve, "shared_gb": shared, "vram_gb": carve + shared, "gtt_gb": gtt_gb})
     return g
 
 
@@ -1825,6 +1826,16 @@ def gfx1103_notes(gpu, ram) -> list[str]:
         notes.append(f"!the GPU can reach {gpu.get('shared_gb', 0):.0f} GB of shared memory (the GTT pool; the kernel's "
                      "default is about half of the RAM). The kernel option ttm.pages_limit raises it; setup changes no "
                      "host setting - a bigger model needs the room, a smaller one runs as it is")
+    gtt = gpu.get("gtt_gb", 0.0)
+    carve = gpu.get("dedicated_gb", gpu.get("vram_gb", 0.0))
+    if gtt > ram:
+        notes.append(f"!the kernel gives the GPU a {gtt:.0f} GB GTT pool but the {carve:.1f} GB carve-out leaves only "
+                     f"{ram:.0f} GB of RAM - the pool is bigger than the machine, and the run has nothing left to work "
+                     "in. Lower ttm.pages_limit (4 KB pages) or the carve-out: a 64 GB 780M box runs on 8 GB carve-out "
+                     "+ 48 GB GTT and does not on 16 GB + 48 GB (docs/GFX1103.md §1.1)")
+    elif gtt > ram - 4:
+        notes.append(f"  the GTT pool ({gtt:.0f} GB) is within 4 GB of the {ram:.0f} GB of RAM left after the "
+                     f"{carve:.1f} GB carve-out: it works, but there is little headroom. docs/GFX1103.md §1.1")
     return notes
 
 

@@ -36,7 +36,7 @@ To check by hand:
 | --- | --- | --- |
 | OS | `[Environment]::OSVersion` | `cat /etc/os-release` |
 | NVIDIA GPU, VRAM, driver | `nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv` | the same |
-| AMD GPU | `Get-CimInstance Win32_VideoController \| Select-Object Name, AdapterRAM` (AdapterRAM is capped at 4 GB; trust the model name) | `lspci \| grep -i -E 'vga\|display'`; VRAM: `cat /sys/class/drm/card*/device/mem_info_vram_total` (bytes); `rocm-smi` only if ROCm is installed |
+| AMD GPU | `Get-CimInstance Win32_VideoController \| Select-Object Name, AdapterRAM` (AdapterRAM is capped at 4 GB; trust the model name) | `lspci \| grep -i -E 'vga\|display'`; VRAM: `cat /sys/class/drm/card*/device/mem_info_vram_total` (bytes); on an integrated Radeon also `mem_info_gtt_total` in the same directory (the RAM the GPU can reach); `rocm-smi` only if ROCm is installed |
 | RAM | `(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB` | `free -g` |
 | Free disk | `Get-PSDrive -PSProvider FileSystem` | `df -h .` |
 
@@ -44,8 +44,13 @@ Requirements (details: [INSTALL.md](INSTALL.md#what-you-need)):
 
 - **GPU:** NVIDIA RTX 20, 30, 40 or 50 series, or AMD Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT,
   RX 9070 / 9070 XT, Radeon AI PRO R9700, RX 6800 / 6900 series; 12 GB of VRAM or more (an NVIDIA card with 8 GB runs,
-  slowly). GTX 10 series and older, and integrated GPUs, are not supported; Pascal / Volta cards (P40, V100) and some
-  older AMD cards have experimental paths the user opts into ([OLDER_GPUS.md](OLDER_GPUS.md)).
+  slowly). GTX 10 series and older are not supported; Pascal / Volta cards (P40, V100) and some
+  older AMD cards have experimental paths the user opts into ([OLDER_GPUS.md](OLDER_GPUS.md)). Integrated Radeon
+  GPUs on Linux are supported: the Ryzen 7040 / 8040 iGPU (780M / 760M / 740M, gfx1103) is measured
+  ([GFX1103.md](GFX1103.md)) and the Ryzen AI Max (gfx1151) is experimental ([STRIX_HALO.md](STRIX_HALO.md)); a
+  Strix Point (890M / 880M) or Krackan (860M / 840M) is not. On an iGPU the BIOS carve-out and the GTT pool are two
+  slices of the same RAM, and together they must leave room: the measured 64 GB 780M box runs on an 8 GB carve-out
+  with a 48 GB GTT and does not run on 16 GB + 48 GB (GFX1103.md §1.1).
 - **Driver:** NVIDIA 580 or newer. AMD on Linux: the kernel's amdgpu driver; on Windows: a current AMD Adrenalin
   driver. If the driver is missing or too old, tell the user to update it (NVIDIA App / nvidia.com/drivers, or AMD
   Software) and restart; do not install drivers yourself unless they ask.

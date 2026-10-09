@@ -1,7 +1,9 @@
 # Integrated GPU (APU) expert path: alias, don't copy
 
 Branch `igpu-rework`, off `gfx1103` (Engine 0.1.36 base). Machine: Ryzen 7 8700G
-+ Radeon 780M (gfx1103), 45 GiB RAM, Ubuntu 26.04, ROCm 10.0.0~pre4. Model and
++ Radeon 780M (gfx1103), 64 GiB RAM - 8 GiB carved out for the iGPU and 48 GiB of
+the rest addressable by the GPU as the GTT pool (docs/GFX1103.md §1.1) - Ubuntu
+26.04, ROCm 10.0.0~pre4. Model and
 configuration as in `docs/GFX1103.md` (Q2_0, `--expert-cache 6000`,
 `--mmap-experts`, tuned table).
 
@@ -667,8 +669,9 @@ budget.**
 - The prefault pass worked: "one DMA read pass over 31.64 GiB in
   898 ms" (35 GB/s, the measured H2D rate).
 - But the 1 GiB H2D target + the pass itself ran up the iGPU's VRAM
-  budget: the card's carve-out is **16 GiB** (mem_info_vram_total,
-  idle-used 164 MB), and prefill then reported "device buffers for a
+  budget: the card's carve-out read **16 GiB** at that scan (mem_info_vram_total,
+  idle-used 164 MB; it is 8 GiB on the current BIOS setting, docs/GFX1103.md §1.1),
+  and prefill then reported "device buffers for a
   chunk of 512 tokens do not fit" and aborted cleanly.  The
   "unspecified launch failure" lines came during teardown
   (hipModuleUnload) - a stale fault state, and they degrade the APU

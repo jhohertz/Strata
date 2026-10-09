@@ -125,6 +125,21 @@ class ExactArch(unittest.TestCase):
             self.assertAlmostEqual(g["dedicated_gb"], 8.0)
             self.assertAlmostEqual(g["vram_gb"], 8.0 + min(48.0, 64.0 - setup.UMA_OS_LEFT_GB))
 
+    def test_gfx1103_gtt_pool_has_to_fit_in_the_ram_left(self):
+        """The carve-out and the GTT pool are slices of the same DIMMs, so a pool bigger than the RAM left after the
+        carve-out leaves nothing for the run.  Two reference boxes: 8 GB + 48 GB on 64 GB works, 16 GB + 48 GB does not.
+        setup reads mem_info_gtt_total and says which side of the line the machine is on."""
+        ref = setup.amd_apply_uma({"arch": "gfx1103", "vram_gb": 8.0}, 48.0, 53.53)      # the measured 780M box
+        self.assertAlmostEqual(ref["gtt_gb"], 48.0)
+        with mock.patch.object(setup, "WIN", False):
+            text = chr(10).join(setup.gfx1103_notes(ref, 53.53))
+        self.assertNotIn("pool is bigger than the machine", text)
+        over = setup.amd_apply_uma({"arch": "gfx1103", "vram_gb": 16.0}, 48.0, 45.5)    # the box that would not run
+        with mock.patch.object(setup, "WIN", False):
+            text = chr(10).join(setup.gfx1103_notes(over, 45.5))
+        self.assertIn("pool is bigger than the machine", text)
+        self.assertIn("ttm.pages_limit", text)
+
 
 class PciIds(unittest.TestCase):
     def test_strix_halo_id(self):

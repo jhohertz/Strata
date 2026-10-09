@@ -139,7 +139,10 @@ cmake --build build-hip --target strata -j2
 `CMAKE_HIP_ARCHITECTURES` is `gfx1100`, `gfx1101`, `gfx1103`, `gfx1200`, `gfx1201`, or a list such as
 `"gfx1100;gfx1201"` (one binary for both). gfx1103 (the Radeon 780M / 760M / 740M iGPU) is validated on the
 reference APU - pass `-DCMAKE_HIP_ARCHITECTURES=gfx1103` and build all targets, not just `strata`
-([GFX1103.md](GFX1103.md); the integrated-memory path, [IGPU.md](IGPU.md)). gfx1102 (the same wave32, 64 KiB
+([GFX1103.md](GFX1103.md); the integrated-memory path, [IGPU.md](IGPU.md)). On an iGPU the BIOS carve-out and the
+GTT pool are slices of the same RAM and together they have to leave room: the reference box (64 GB RAM) runs on an
+8 GB carve-out with a 48 GB GTT (`ttm.pages_limit=12582912`) and does not run on 16 GB + 48 GB (GFX1103.md §1.1).
+gfx1102 (the same wave32, 64 KiB
 LDS and dot4 instruction) builds with a warning: it passed ctest (#192), and one RX 7600 XT (16 GB, i7-13700K,
 64 GB) ran Swift IQ3_XXS over 146 requests up to 51K context at about 43 tok/s decode (28-50) and 250-300 tok/s
 prompt (#942); setup accepts it (unvalidated, #938); so does gfx1030 (RDNA2: the older `v_dot4_i32_i8`, a
